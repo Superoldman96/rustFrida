@@ -168,6 +168,7 @@ define_string_table!(
     (dlsym_err, b"dlsymFail"),
     (proc_path, b"/proc/self/fd/"),
     (cmdline, b"novalue"),
+    (output_path, b"novalue"),
     // 未来添加字符串只需在这里添加新行即可
 );
 
@@ -639,7 +640,7 @@ fn write_memory<T>(pid: i32, addr: usize, data: &T) -> Result<(), String> {
 }
 
 /// 向远程进程内存写入字节数组
-/// 
+///
 /// # 参数
 /// * `pid` - 目标进程ID
 /// * `addr` - 目标地址
@@ -764,6 +765,33 @@ fn inject_to_process(pid: i32, string_overrides: &std::collections::HashMap<Stri
     }
 }
 
+/// 根据 UID 查找 /data/data/ 目录下对应的应用数据目录
+fn find_data_dir_by_uid(uid: u32) -> Option<String> {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+
+    let data_dir = "/data/data";
+
+    match fs::read_dir(data_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if let Ok(metadata) = entry.metadata() {
+                    if metadata.uid() == uid {
+                        if let Some(path) = entry.path().to_str() {
+                            return Some(path.to_string());
+                        }
+                    }
+                }
+            }
+            None
+        }
+        Err(e) => {
+            eprintln!("读取 /data/data 目录失败: {}", e);
+            None
+        }
+    }
+}
+
 /// 使用 eBPF 监听 SO 加载并自动附加
 fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>, string_overrides: &std::collections::HashMap<String, String>) -> Result<(), String> {
     use ldmonitor::DlopenMonitor;
@@ -782,13 +810,24 @@ fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>, string_override
         monitor.wait_for_path(so_pattern)
     };
 
-    // 停止并卸载 eBPF 程序
     monitor.stop();
 
     match info {
         Some(dlopen_info) => {
-            println!("检测到 SO 加载: pid={}, path={}", dlopen_info.pid, dlopen_info.path);
-            inject_to_process(dlopen_info.pid as i32, string_overrides)
+            println!("检测到 SO 加载: pid={}, uid={}, path={}", dlopen_info.pid, dlopen_info.uid, dlopen_info.path);
+
+            // 克隆 string_overrides 以便修改
+            let mut overrides = string_overrides.clone();
+
+            // 根据 uid 自动检测 /data/data/ 目录
+            if let Some(data_dir) = find_data_dir_by_uid(dlopen_info.uid) {
+                println!("自动检测到应用数据目录: {}", data_dir);
+                overrides.insert("output_path".to_string(), data_dir);
+            } else {
+                println!("警告: 未能找到 uid {} 对应的 /data/data/ 目录", dlopen_info.uid);
+            }
+
+            inject_to_process(dlopen_info.pid as i32, &overrides)
         }
         None => Err("监听超时，未检测到匹配的 SO 加载".to_string())
     }

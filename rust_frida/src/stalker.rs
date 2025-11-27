@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::format;
-use std::io::{Write, Read, Seek, SeekFrom};
+use std::io::Write;
 use std::thread;
 use std::sync::Mutex;
 use std::fs::{OpenOptions, File};
@@ -11,7 +11,7 @@ use frida_gum::stalker::{Event, EventMask, EventSink, Stalker, Transformer};
 use lazy_static::lazy_static;
 use crossbeam_channel::{bounded, Sender};
 use frida_gum::{Module, ModuleMap, NativePointer, Process};
-use crate::{log_msg, GLOBAL_STREAM};
+use crate::{log_msg, GLOBAL_STREAM, OUTPUT_PATH};
 use prost::Message;
 use frida_gum::interceptor::{Interceptor, InvocationContext, InvocationListener};
 
@@ -100,12 +100,19 @@ lazy_static! {
 
         // 启动后台工作线程
         thread::spawn(move || {
-            // 打开或创建日志文件
-            let log_path = "/data/data/com.example.tracersample/files/trace.log";
+            // 获取输出路径，构造日志文件路径
+            let log_path = match OUTPUT_PATH.get() {
+                Some(base) => format!("{}/trace.log", base),
+                None => {
+                    log_msg("错误: OUTPUT_PATH 未设置，无法创建日志文件".to_string());
+                    return;
+                }
+            };
+
             let mut log_file = match OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(log_path)
+                .open(&log_path)
             {
                 Ok(f) => f,
                 Err(e) => {
@@ -210,12 +217,14 @@ fn parse_maps_line(line: &str) -> Option<(u64, u64, String, u64, String, u64, St
     Some((start_addr, end_addr, permissions, offset, dev, inode, pathname))
 }
 
-// 从 /proc/self/mem 读取指定地址范围的内存
-fn read_memory_region(mem_file: &mut File, start_addr: u64, size: usize) -> std::io::Result<Vec<u8>> {
-    let mut buffer = vec![0u8; size];
-    mem_file.seek(SeekFrom::Start(start_addr))?;
-    mem_file.read_exact(&mut buffer)?;
-    Ok(buffer)
+// 直接读取指定地址范围的内存（无需 /proc/self/mem）
+fn read_memory_region(start_addr: u64, size: usize) -> std::io::Result<Vec<u8>> {
+    unsafe {
+        // 直接通过指针访问本进程内存
+        let ptr = start_addr as *const u8;
+        let slice = std::slice::from_raw_parts(ptr, size);
+        Ok(slice.to_vec())
+    }
 }
 
 // Dump 内存快照到文件（流式写入版本）
@@ -257,14 +266,15 @@ fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::Other, format!("Header 编码失败: {}", e))
     })?;
     output_file.write_all(&header_buf)?;
-    // 打开 /proc/self/mem
-    let mut mem_file = File::open("/proc/self/mem")?;
-    log_msg("3".to_string());
+    log_msg("dump header finished".to_string());
 
     // 2. 流式处理每个内存区域
     let mut processed_count = 0u32;
     for line in maps_content.lines() {
         if let Some((start_addr, end_addr, permissions, offset, dev, inode, pathname)) = parse_maps_line(line) {
+            if !pathname.contains(".so"){
+                continue;
+            }
             // 只 dump 可读的内存区域
             if !permissions.starts_with('r') {
                 continue;
@@ -272,8 +282,8 @@ fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
 
             let size = (end_addr - start_addr) as usize;
 
-            // 读取内存数据（可能失败，例如某些特殊区域）
-            let data = match read_memory_region(&mut mem_file, start_addr, size) {
+            // 直接读取内存数据（可能失败，例如某些特殊区域）
+            let data = match read_memory_region(start_addr, size) {
                 Ok(d) => d,
                 Err(e) => {
                     log_msg(format!("无法读取内存区域 0x{:x}-0x{:x}: {}", start_addr, end_addr, e));
@@ -302,6 +312,7 @@ fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
 
             processed_count += 1;
 
+            // log_msg(format!("processed memory region: {} {} {}",start_addr, end_addr, pathname));
             // region 和 region_buf 在这里被丢弃，释放内存
         }
     }
@@ -336,18 +347,41 @@ impl EventSink for SampleEventSink {
     }
 }
 
-pub fn follow(tid:usize) {
-    // 在开始追踪前先 dump 内存快照
-    let snapshot_path = "/data/data/com.zhenxi.hunter/files/memory_snapshot.pb";
-    match dump_memory_snapshot(snapshot_path) {
-        Ok(_) => {
-            log_msg(format!("内存快照已保存到: {}\n", snapshot_path))
-        }
-        Err(e) => {
-            log_msg(format!("内存快照保存失败: {}\n", e))
-        }
-    }
+/// 启动内存 dump 线程（非阻塞）
+///
+/// # 参数
+/// - `output_path`: 内存快照输出路径
+///
+/// # 返回
+/// - `std::thread::JoinHandle`: 线程句柄，可用于等待 dump 完成
+pub fn spawn_memory_dump_thread(output_path: String) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
 
+        match dump_memory_snapshot(&output_path) {
+            Ok(_) => {
+                log_msg(format!("内存快照已保存到: {}\n", output_path))
+            }
+            Err(e) => {
+                log_msg(format!("内存快照保存失败: {}\n", e))
+            }
+        }
+    })
+}
+
+pub fn start_dump_mem(){
+    // 在开始追踪前启动内存 dump 线程（非阻塞）
+    let snapshot_path = match OUTPUT_PATH.get() {
+        Some(base) => format!("{}/memory_snapshot.pb", base),
+        None => {
+            log_msg("错误: OUTPUT_PATH 未设置，无法保存内存快照\n".to_string());
+            return;
+        }
+    };
+
+    let _dump_handle = spawn_memory_dump_thread(snapshot_path);
+}
+
+pub fn follow(tid:usize) {
     let mut stalker = Stalker::new(&GUM);
 
     let mut mdmap = ModuleMap::default();
@@ -457,7 +491,8 @@ struct OpenListener;
 
 impl InvocationListener for OpenListener {
     fn on_enter(&mut self, _context: InvocationContext) {
-        log_msg(format!("oopps trace {}",_context.thread_id()))
+        log_msg(format!("oopps trace {}",_context.thread_id()));
+        start_dump_mem();
         // follow(_context.thread_id() as usize);
     }
 

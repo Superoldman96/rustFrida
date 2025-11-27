@@ -31,6 +31,57 @@ use crate::stalker::hfollow;
 // 定义我们自己的Result类型，错误统一为String
 type Result<T> = std::result::Result<T, String>;
 
+// StringTable 结构定义（需要和 main.rs 中的定义完全一致）
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StringTable {
+    pub socket_name: u64,
+    pub socket_name_len: u32,
+    pub hello_msg: u64,
+    pub hello_msg_len: u32,
+    pub sym_name: u64,
+    pub sym_name_len: u32,
+    pub pthread_err: u64,
+    pub pthread_err_len: u32,
+    pub dlsym_err: u64,
+    pub dlsym_err_len: u32,
+    pub proc_path: u64,
+    pub proc_path_len: u32,
+    pub cmdline: u64,
+    pub cmdline_len: u32,
+    pub output_path: u64,
+    pub output_path_len: u32,
+}
+
+impl StringTable {
+    /// 从指针地址读取字符串（不包含末尾的 NULL）
+    unsafe fn read_string(&self, addr: u64, len: u32) -> Option<String> {
+        if addr == 0 || len == 0 {
+            return None;
+        }
+        let ptr = addr as *const u8;
+        let slice = std::slice::from_raw_parts(ptr, len as usize);
+        // 去掉末尾的 NULL 字符
+        let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+        String::from_utf8(slice[..end].to_vec()).ok()
+    }
+
+    /// 获取 socket_name
+    pub unsafe fn get_socket_name(&self) -> Option<String> {
+        self.read_string(self.socket_name, self.socket_name_len)
+    }
+
+    /// 获取 cmdline
+    pub unsafe fn get_cmdline(&self) -> Option<String> {
+        self.read_string(self.cmdline, self.cmdline_len)
+    }
+
+    /// 获取 output_path
+    pub unsafe fn get_output_path(&self) -> Option<String> {
+        self.read_string(self.output_path, self.output_path_len)
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 struct UserRegs {
@@ -498,6 +549,7 @@ fn arm64_cond_pass(cond: u8, pstate: usize) -> bool {
 
 static GLOBAL_STREAM: OnceLock<UnixStream> = OnceLock::new();
 static CACHE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+pub static OUTPUT_PATH: OnceLock<String> = OnceLock::new();
 
 /// 日志函数：socket未连接时缓存，已连接时直接发送
 fn log_msg(msg: String ){
@@ -525,11 +577,25 @@ fn flush_cached_logs() {
     }
 }
 #[no_mangle]
-pub extern "C" fn hello_entry(cmdline:*const c_char) {
+pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
     unsafe {
-        let cmd = CStr::from_ptr(cmdline).to_str().unwrap();
-        if cmd != "novalue"{
-            process_cmd(cmd) ;
+        // 解析 StringTable 结构
+        let string_table = string_table as *const StringTable;
+        let table = &*string_table;
+
+        // 读取 output_path 并保存到全局变量
+        if let Some(output) = table.get_output_path() {
+            if output != "novalue" {
+                let _ = OUTPUT_PATH.set(output.clone());
+                log_msg(format!("Output path: {}\n", output));
+            }
+        }
+
+        // 读取 cmdline 参数
+        if let Some(cmd) = table.get_cmdline() {
+            if cmd != "novalue" {
+                process_cmd(&cmd);
+            }
         }
     }
 
@@ -568,6 +634,7 @@ pub extern "C" fn hello_entry(cmdline:*const c_char) {
             }
         }
     }
+    null_mut()
 }
 
 fn process_cmd(command: &str) {

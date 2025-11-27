@@ -27,6 +27,9 @@ typedef struct {
 
     uint64_t cmdline;
     uint32_t cmdline_len;
+
+    uint64_t output_path;
+    uint32_t output_path_len;
 } StringTable;
 
 // 定义与main.rs中相同的结构体
@@ -112,7 +115,7 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
     const char* proc_path = (const char*)table->proc_path;
     // proc_path 可以直接作为 C 字符串使用，因为已有 NULL 结尾
 
-    const char* cmdline = (const char*)table->cmdline;
+//    const char* cmdline = (const char*)table->cmdline;
 //    size_t cmdline_len = table->cmdline_len - 1;
     
     
@@ -195,7 +198,7 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
         
         pthread_t tid;
         // 传递 socket_name 作为参数给 hello_entry 函数
-        if (pthread_create(&tid, NULL, sym, (void*)cmdline) == 0) {
+        if (pthread_create(&tid, NULL, sym, (void*)table) == 0) {
             pthread_detach(tid);
         } else {
             // 发送线程创建失败消息
