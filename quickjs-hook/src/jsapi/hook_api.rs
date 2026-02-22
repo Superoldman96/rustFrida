@@ -428,12 +428,12 @@ unsafe extern "C" fn js_call_native(
 
     // Return Number when the result magnitude fits exactly as f64 (≤ 2^53).
     // Use unsigned_abs() so negative i64 results (e.g. errno -1) are also returned
-    // as JS Number instead of wrapping to a huge BigUint64.
+    // as JS Number instead of wrapping to a huge BigInt.
     // JS_NewInt64 encodes small integers as JS_TAG_INT (typeof === "number").
     if result.unsigned_abs() <= (1u64 << 53) {
         ffi::qjs_new_int64(ctx, result)
     } else {
-        ffi::JS_NewBigUint64(ctx, result as u64)
+        ffi::JS_NewBigInt64(ctx, result)
     }
 }
 

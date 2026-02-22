@@ -10,7 +10,7 @@ use std::ffi::{c_void, CStr, CString};
 use std::hash::Hash;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::ptr::{null, null_mut};
+
 use std::sync::OnceLock;
 use std::{mem, ptr};
 
@@ -82,19 +82,18 @@ static apilevel: OnceLock<i32> = OnceLock::new();
 static codename: OnceLock<String> = OnceLock::new();
 
 pub fn jhook() -> Result<String, String> {
-    let mut stream = GLOBAL_STREAM.get().unwrap();
     let lib_art = unsafe { dlopen(CString::new("libart.so").unwrap().as_ptr(), RTLD_NOW) };
     if lib_art.is_null() {
-        stream
-            .write_all(format!("dlopen failed").as_bytes())
-            .unwrap();
+        if let Some(mut stream) = GLOBAL_STREAM.get() {
+            let _ = stream.write_all(b"dlopen failed");
+        }
         return Err(String::from("dlopen failed"));
     }
     let lib_c = unsafe { dlopen(CString::new("libc.so").unwrap().as_ptr(), RTLD_NOW) };
     if lib_c.is_null() {
-        stream
-            .write_all(format!("dlopen failed").as_bytes())
-            .unwrap();
+        if let Some(mut stream) = GLOBAL_STREAM.get() {
+            let _ = stream.write_all(b"dlopen failed");
+        }
         return Err(String::from("dlopen failed"));
     }
 
@@ -162,7 +161,7 @@ pub fn jhook() -> Result<String, String> {
         let startOffset = if size_of::<usize>() == 4 { 200 } else { 384 };
         let endOffset = startOffset + (100 * size_of::<usize>());
 
-        let mut spec: *const HashMap<&str, usize> = null_mut();
+        let mut spec_found = false;
         for offset in (startOffset..=endOffset).step_by(size_of::<usize>()) {
             let value = runtime_ptr.offset(offset as isize);
             if value == jvm_ptr as *mut usize {
@@ -184,12 +183,12 @@ pub fn jhook() -> Result<String, String> {
                     let intern_table_offset = classlinker_offset - pointer_size;
 
                     let mut candidate = HashMap::new();
-                    candidate.insert("classLinker", classlinker_offset.clone());
-                    candidate.insert("internTable", intern_table_offset.clone());
+                    candidate.insert("classLinker", *classlinker_offset);
+                    candidate.insert("internTable", intern_table_offset);
 
                     match tryGetArtClassLinkerSpec(runtime_ptr, &candidate) {
                         Ok(_) => {
-                            spec = &candidate;
+                            spec_found = true;
                             break;
                         }
                         Err(_) => {}
@@ -199,10 +198,10 @@ pub fn jhook() -> Result<String, String> {
             }
         }
 
-        if spec == null() {
-            stream
-                .write_all(format!("find offset failed").as_bytes())
-                .unwrap();
+        if !spec_found {
+            if let Some(mut stream) = GLOBAL_STREAM.get() {
+                let _ = stream.write_all(b"find offset failed");
+            }
             return Err(String::from("find offset failed"));
         }
     }

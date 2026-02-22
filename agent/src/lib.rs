@@ -122,10 +122,9 @@ impl ExecMem {
         }
     }
 
-    /// 写入数据，自动扩容（每次扩容一页）
+    /// 写入数据（容量不足时返回错误）
     pub fn write(&mut self, data: &[u8]) -> Result<*mut u8> {
         if self.used + data.len() > self.size {
-            // self.grow()?;
             return Err(String::from("剩余exe_mem耗尽"));
         }
         unsafe {
@@ -143,37 +142,6 @@ impl ExecMem {
     pub fn write_u32(&mut self, value: u32) -> Result<*mut u8> {
         let bytes = value.to_le_bytes(); // ARM64 小端
         self.write(&bytes)
-    }
-
-    /// 扩容（每次扩容一页）
-    fn grow(&mut self) -> Result<()> {
-        let new_size = self.size + self.page_size;
-        unsafe {
-            // 申请新内存
-            let new_ptr = mmap(
-                null_mut(),
-                new_size,
-                PROT_READ | PROT_WRITE | PROT_EXEC,
-                MAP_PRIVATE | MAP_ANONYMOUS,
-                -1,
-                0,
-            );
-            if new_ptr == libc::MAP_FAILED {
-                return Err(format!(
-                    "无法扩展内存 ({}->{}): {}",
-                    self.size,
-                    new_size,
-                    Error::last_os_error()
-                ));
-            }
-            // 拷贝旧数据
-            ptr::copy_nonoverlapping(self.ptr, new_ptr as *mut u8, self.used);
-            // 释放旧内存
-            munmap(self.ptr as *mut _, self.size);
-            self.ptr = new_ptr as *mut u8;
-            self.size = new_size;
-        }
-        Ok(())
     }
 
     pub fn current_addr(&self) -> usize {
@@ -738,16 +706,14 @@ fn process_cmd(command: &str) {
             std::thread::spawn(move || {
                 match trace::gum_modify_thread(tid) {
                     Ok(pid) => {
-                        let _ = GLOBAL_STREAM
-                            .get()
-                            .unwrap()
-                            .write_all(format!("clone success {}", pid).as_bytes());
+                        if let Some(mut s) = GLOBAL_STREAM.get() {
+                            let _ = s.write_all(format!("clone success {}", pid).as_bytes());
+                        }
                     }
                     Err(e) => {
-                        let _ = GLOBAL_STREAM
-                            .get()
-                            .unwrap()
-                            .write_all(format!("error: {}", e).as_bytes());
+                        if let Some(mut s) = GLOBAL_STREAM.get() {
+                            let _ = s.write_all(format!("error: {}", e).as_bytes());
+                        }
                     }
                 }
                 unsafe { kill(process::id() as pid_t, SIGSTOP) }
@@ -757,10 +723,9 @@ fn process_cmd(command: &str) {
             std::thread::spawn(|| match jhook() {
                 Ok(_) => {}
                 Err(e) => {
-                    let _ = GLOBAL_STREAM
-                        .get()
-                        .unwrap()
-                        .write_all(format!("{}", e).as_bytes());
+                    if let Some(mut s) = GLOBAL_STREAM.get() {
+                        let _ = s.write_all(format!("{}", e).as_bytes());
+                    }
                 }
             });
         }
