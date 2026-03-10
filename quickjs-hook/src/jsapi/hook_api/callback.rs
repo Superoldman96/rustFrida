@@ -5,9 +5,10 @@
 
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
-use crate::jsapi::callback_util::{invoke_hook_callback_common, set_js_u64_property};
-use crate::value::JSValue;
-use std::ffi::CString;
+use crate::jsapi::callback_util::{
+    get_js_u64_property, invoke_hook_callback_common, js_u64_to_js_number_or_bigint,
+    set_js_cfunction_property, set_js_u64_property,
+};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::registry::HOOK_REGISTRY;
@@ -75,27 +76,14 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
             set_js_u64_property(ctx, js_ctx, "sp", hook_ctx.sp);
             set_js_u64_property(ctx, js_ctx, "pc", hook_ctx.pc);
             set_js_u64_property(ctx, js_ctx, "trampoline", trampoline);
-
-            let cname = CString::new("orig").unwrap();
-            let func_val =
-                ffi::qjs_new_cfunction(ctx, Some(js_native_call_original), cname.as_ptr(), 0);
-            JSValue(js_ctx).set_property(ctx, "orig", JSValue(func_val));
+            set_js_cfunction_property(ctx, js_ctx, "orig", js_native_call_original, 0);
 
             js_ctx
         },
         // 处理返回值：从上下文对象读回 x0（replace mode 只恢复 x0）
         |ctx, js_ctx, _result| {
             result_was_set = true;
-            let cprop = CString::new("x0").unwrap();
-            let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
-            let val = ffi::qjs_get_property(ctx, js_ctx, atom);
-            ffi::JS_FreeAtom(ctx, atom);
-
-            let js_val = JSValue(val);
-            if let Some(new_val) = js_val.to_u64(ctx) {
-                (*ctx_ptr).x[0] = new_val;
-            }
-            js_val.free(ctx);
+            (*ctx_ptr).x[0] = get_js_u64_property(ctx, js_ctx, "x0");
         },
     );
 
@@ -138,9 +126,5 @@ unsafe extern "C" fn js_native_call_original(
     (*ctx_ptr).x[0] = result;
 
     // Return value: Number (≤2^53) or BigUint64
-    if result <= (1u64 << 53) {
-        ffi::qjs_new_int64(ctx, result as i64)
-    } else {
-        ffi::JS_NewBigUint64(ctx, result)
-    }
+    js_u64_to_js_number_or_bigint(ctx, result)
 }

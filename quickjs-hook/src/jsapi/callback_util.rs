@@ -6,13 +6,16 @@
 use crate::ffi;
 use crate::jsapi::console::output_message;
 use crate::jsapi::ptr::get_native_pointer_addr;
+use crate::jsapi::util::JSCFn;
 use crate::value::JSValue;
 use crate::JSEngine;
+use std::ffi::CString;
 use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
 
 const CALLBACK_LOCK_WAIT_SPIN_LIMIT: usize = 32;
 const CALLBACK_LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(3);
+const JS_MAX_SAFE_INTEGER: u64 = 1u64 << 53;
 
 pub(crate) enum JsEngineCallbackGuard {
     Locked {
@@ -238,6 +241,43 @@ pub(crate) unsafe fn extract_pointer_address(
     Err(ffi::JS_ThrowTypeError(ctx, msg.as_ptr()))
 }
 
+/// Extract a string argument from JSValue.
+pub(crate) unsafe fn extract_string_arg(
+    ctx: *mut ffi::JSContext,
+    arg: JSValue,
+    error_msg: &[u8],
+) -> Result<String, ffi::JSValue> {
+    arg.to_string(ctx)
+        .ok_or_else(|| ffi::JS_ThrowTypeError(ctx, error_msg.as_ptr() as *const _))
+}
+
+/// Ensure a JSValue is a function.
+pub(crate) unsafe fn ensure_function_arg(
+    ctx: *mut ffi::JSContext,
+    arg: JSValue,
+    error_msg: &[u8],
+) -> Result<(), ffi::JSValue> {
+    if arg.is_function(ctx) {
+        Ok(())
+    } else {
+        Err(ffi::JS_ThrowTypeError(ctx, error_msg.as_ptr() as *const _))
+    }
+}
+
+/// Throw a type error from a static byte string.
+pub(crate) unsafe fn throw_type_error(ctx: *mut ffi::JSContext, error_msg: &[u8]) -> ffi::JSValue {
+    ffi::JS_ThrowTypeError(ctx, error_msg.as_ptr() as *const _)
+}
+
+/// Throw an internal error from an owned Rust string.
+pub(crate) unsafe fn throw_internal_error(
+    ctx: *mut ffi::JSContext,
+    message: impl AsRef<str>,
+) -> ffi::JSValue {
+    let err = CString::new(message.as_ref()).unwrap();
+    ffi::JS_ThrowInternalError(ctx, err.as_ptr())
+}
+
 /// Set a u64 property on a JS object as BigUint64.
 /// 封装 CString → JS_NewAtom → JS_NewBigUint64 → qjs_set_property → JS_FreeAtom 模式。
 pub(crate) unsafe fn set_js_u64_property(
@@ -251,6 +291,60 @@ pub(crate) unsafe fn set_js_u64_property(
     let val = ffi::JS_NewBigUint64(ctx, value);
     ffi::qjs_set_property(ctx, obj, atom, val);
     ffi::JS_FreeAtom(ctx, atom);
+}
+
+/// Set a CFunction property on a JS object.
+pub(crate) unsafe fn set_js_cfunction_property(
+    ctx: *mut ffi::JSContext,
+    obj: ffi::JSValue,
+    name: &str,
+    func: JSCFn,
+    argc: i32,
+) {
+    let cname = CString::new(name).unwrap();
+    let func_val = ffi::qjs_new_cfunction(ctx, Some(func), cname.as_ptr(), argc);
+    JSValue(obj).set_property(ctx, name, JSValue(func_val));
+}
+
+/// Read a u64-like property from a JS object. Non-numeric values fall back to 0.
+pub(crate) unsafe fn get_js_u64_property(
+    ctx: *mut ffi::JSContext,
+    obj: ffi::JSValue,
+    name: &str,
+) -> u64 {
+    let prop = JSValue(obj).get_property(ctx, name);
+    let value = prop.to_u64(ctx).unwrap_or(0);
+    prop.free(ctx);
+    value
+}
+
+/// Convert a JS numeric/BigInt value to u64, defaulting to 0 on conversion failure.
+pub(crate) unsafe fn js_value_to_u64_or_zero(ctx: *mut ffi::JSContext, value: JSValue) -> u64 {
+    value.to_u64(ctx).unwrap_or(0)
+}
+
+/// Encode a u64 as Number when it fits JS safe integer range, otherwise BigUint64.
+pub(crate) unsafe fn js_u64_to_js_number_or_bigint(
+    ctx: *mut ffi::JSContext,
+    value: u64,
+) -> ffi::JSValue {
+    if value <= JS_MAX_SAFE_INTEGER {
+        ffi::qjs_new_int64(ctx, value as i64)
+    } else {
+        ffi::JS_NewBigUint64(ctx, value)
+    }
+}
+
+/// Encode an i64 as Number when it fits JS safe integer range, otherwise BigInt64.
+pub(crate) unsafe fn js_i64_to_js_number_or_bigint(
+    ctx: *mut ffi::JSContext,
+    value: i64,
+) -> ffi::JSValue {
+    if value.unsigned_abs() <= JS_MAX_SAFE_INTEGER {
+        ffi::qjs_new_int64(ctx, value)
+    } else {
+        ffi::JS_NewBigInt64(ctx, value)
+    }
 }
 
 /// Duplicate a JS callback value and return its raw bytes for Send/Sync-safe storage.

@@ -2,7 +2,10 @@
 
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
-use crate::jsapi::callback_util::{dup_callback_to_bytes, extract_pointer_address};
+use crate::jsapi::callback_util::{
+    dup_callback_to_bytes, ensure_function_arg, extract_pointer_address,
+    js_i64_to_js_number_or_bigint, js_value_to_u64_or_zero, throw_internal_error,
+};
 use crate::jsapi::util::is_addr_accessible;
 use crate::value::JSValue;
 
@@ -43,11 +46,12 @@ pub(crate) unsafe extern "C" fn js_hook(
     };
 
     // Check callback is a function
-    if !callback_arg.is_function(ctx) {
-        return ffi::JS_ThrowTypeError(
-            ctx,
-            b"hook() second argument must be a function\0".as_ptr() as *const _,
-        );
+    if let Err(err) = ensure_function_arg(
+        ctx,
+        callback_arg,
+        b"hook() second argument must be a function\0",
+    ) {
+        return err;
     }
 
     // Initialize registry
@@ -69,10 +73,7 @@ pub(crate) unsafe extern "C" fn js_hook(
         // hook 安装失败，释放 JS 回调引用
         let callback: ffi::JSValue = std::ptr::read(callback_bytes.as_ptr() as *const ffi::JSValue);
         ffi::qjs_free_value(ctx, callback);
-        return ffi::JS_ThrowInternalError(
-            ctx,
-            b"hook_replace failed: could not install hook\0".as_ptr() as *const _,
-        );
+        return throw_internal_error(ctx, "hook_replace failed: could not install hook");
     }
 
     // hook 已安装，将 callback 和 trampoline 插入 registry
@@ -190,10 +191,7 @@ pub(crate) unsafe extern "C" fn js_call_native(
     for i in 0..6usize {
         if (i + 1) < argc as usize {
             let arg = JSValue(*argv.add(i + 1));
-            if let Some(v) = arg.to_u64(ctx) {
-                args[i] = v;
-            }
-            // If conversion fails (e.g. non-numeric arg), keep default 0
+            args[i] = js_value_to_u64_or_zero(ctx, arg);
         }
     }
 
@@ -205,9 +203,5 @@ pub(crate) unsafe extern "C" fn js_call_native(
     // Use unsigned_abs() so negative i64 results (e.g. errno -1) are also returned
     // as JS Number instead of wrapping to a huge BigInt.
     // JS_NewInt64 encodes small integers as JS_TAG_INT (typeof === "number").
-    if result.unsigned_abs() <= (1u64 << 53) {
-        ffi::qjs_new_int64(ctx, result)
-    } else {
-        ffi::JS_NewBigInt64(ctx, result)
-    }
+    js_i64_to_js_number_or_bigint(ctx, result)
 }

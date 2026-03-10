@@ -104,7 +104,7 @@ unsafe extern "C" fn js_art_router_debug(
         let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref registry) = *guard {
             for (art_method, data) in registry.iter() {
-                if let Some(spec) = jni_core::ART_METHOD_SPEC.get() {
+                if let Some(spec) = ART_METHOD_SPEC.get() {
                     let current_ep = std::ptr::read_volatile(
                         (*art_method as usize + spec.entry_point_offset) as *const u64,
                     );

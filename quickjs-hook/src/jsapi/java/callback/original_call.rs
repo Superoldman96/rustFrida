@@ -49,13 +49,7 @@ unsafe fn marshal_js_to_jvalue(
         Some(s) if !s.is_empty() => s,
         _ => {
             // No type info — try number or bigint
-            if let Some(v) = val.to_u64(ctx) {
-                return v;
-            }
-            if let Some(v) = val.to_i64(ctx) {
-                return v as u64;
-            }
-            return 0;
+            return js_value_to_u64_or_zero(ctx, val);
         }
     };
 
@@ -87,13 +81,7 @@ unsafe fn marshal_js_to_jvalue(
             }
         }
         b'J' => {
-            if let Some(v) = val.to_u64(ctx) {
-                v
-            } else if let Some(v) = val.to_i64(ctx) {
-                v as u64
-            } else {
-                0
-            }
+            js_value_to_u64_or_zero(ctx, val)
         }
         b'F' => {
             if let Some(f) = val.to_float() {
@@ -131,27 +119,16 @@ unsafe fn marshal_js_to_jvalue(
             if val.is_object() {
                 let jptr_val = val.get_property(ctx, "__jptr");
                 if !jptr_val.is_undefined() && !jptr_val.is_null() {
-                    let result = jptr_val.to_u64(ctx).unwrap_or(0);
+                    let result = js_value_to_u64_or_zero(ctx, jptr_val);
                     jptr_val.free(ctx);
                     return result;
                 }
                 jptr_val.free(ctx);
             }
             // BigUint64 or number (raw jobject pointer)
-            if let Some(v) = val.to_u64(ctx) {
-                return v;
-            }
-            0
+            js_value_to_u64_or_zero(ctx, val)
         }
-        _ => {
-            if let Some(v) = val.to_u64(ctx) {
-                v
-            } else if let Some(v) = val.to_i64(ctx) {
-                v as u64
-            } else {
-                0
-            }
-        }
+        _ => js_value_to_u64_or_zero(ctx, val),
     }
 }
 
@@ -330,11 +307,8 @@ unsafe extern "C" fn js_call_original(
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    let this_obj = JSValue(this_val);
     let art_method_addr = {
-        let prop = this_obj.get_property(ctx, "__hookArtMethod");
-        let value = prop.to_u64(ctx).unwrap_or(0);
-        prop.free(ctx);
+        let value = get_js_u64_property(ctx, this_val, "__hookArtMethod");
         if value != 0 {
             value
         } else {
@@ -342,9 +316,7 @@ unsafe extern "C" fn js_call_original(
         }
     };
     let ctx_ptr = {
-        let prop = this_obj.get_property(ctx, "__hookCtxPtr");
-        let value = prop.to_u64(ctx).unwrap_or(0) as *mut hook_ffi::HookContext;
-        prop.free(ctx);
+        let value = get_js_u64_property(ctx, this_val, "__hookCtxPtr") as *mut hook_ffi::HookContext;
         if !value.is_null() {
             value
         } else {

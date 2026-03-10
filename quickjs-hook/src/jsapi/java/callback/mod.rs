@@ -9,9 +9,10 @@
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::callback_util::{
-    ensure_registry_initialized, invoke_hook_callback_common, BiMap,
+    ensure_registry_initialized, extract_pointer_address, extract_string_arg, get_js_u64_property,
+    invoke_hook_callback_common, js_value_to_u64_or_zero, set_js_cfunction_property,
+    set_js_u64_property, throw_internal_error, throw_type_error, BiMap,
 };
-use crate::jsapi::ptr::get_native_pointer_addr;
 use crate::value::JSValue;
 use std::collections::HashMap;
 use std::ffi::CString;

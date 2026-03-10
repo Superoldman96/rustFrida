@@ -15,11 +15,12 @@
 
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
+use crate::jsapi::callback_util::{
+    dup_callback_to_bytes, ensure_function_arg, extract_string_arg, throw_internal_error,
+    with_registry, with_registry_mut,
+};
 use crate::jsapi::console::output_message;
 use crate::value::JSValue;
-use std::ffi::CString;
-
-use crate::jsapi::callback_util::{dup_callback_to_bytes, with_registry, with_registry_mut};
 
 use super::art_controller::{ensure_art_controller_initialized, stealth_flag};
 use super::art_method::*;
@@ -65,41 +66,39 @@ pub(super) unsafe extern "C" fn js_java_hook(
     let callback_arg = JSValue(*argv.add(3));
 
     // 提取字符串参数
-    let class_name = match class_arg.to_string(ctx) {
-        Some(s) => s,
-        None => {
-            return ffi::JS_ThrowTypeError(
-                ctx,
-                b"Java.hook() first argument must be a class name string\0".as_ptr() as *const _,
-            )
-        }
+    let class_name = match extract_string_arg(
+        ctx,
+        class_arg,
+        b"Java.hook() first argument must be a class name string\0",
+    ) {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
-    let method_name = match method_arg.to_string(ctx) {
-        Some(s) => s,
-        None => {
-            return ffi::JS_ThrowTypeError(
-                ctx,
-                b"Java.hook() second argument must be a method name string\0".as_ptr() as *const _,
-            )
-        }
+    let method_name = match extract_string_arg(
+        ctx,
+        method_arg,
+        b"Java.hook() second argument must be a method name string\0",
+    ) {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
-    let sig_str = match sig_arg.to_string(ctx) {
-        Some(s) => s,
-        None => {
-            return ffi::JS_ThrowTypeError(
-                ctx,
-                b"Java.hook() third argument must be a signature string\0".as_ptr() as *const _,
-            )
-        }
+    let sig_str = match extract_string_arg(
+        ctx,
+        sig_arg,
+        b"Java.hook() third argument must be a signature string\0",
+    ) {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
-    if !callback_arg.is_function(ctx) {
-        return ffi::JS_ThrowTypeError(
-            ctx,
-            b"Java.hook() fourth argument must be a function\0".as_ptr() as *const _,
-        );
+    if let Err(err) = ensure_function_arg(
+        ctx,
+        callback_arg,
+        b"Java.hook() fourth argument must be a function\0",
+    ) {
+        return err;
     }
 
     // 解析 "static:" 前缀
@@ -112,20 +111,14 @@ pub(super) unsafe extern "C" fn js_java_hook(
     // 初始化 JNI
     let env = match ensure_jni_initialized() {
         Ok(e) => e,
-        Err(msg) => {
-            let err = CString::new(msg).unwrap();
-            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
-        }
+        Err(msg) => return throw_internal_error(ctx, msg),
     };
 
     // 解析 ArtMethod
     let (art_method, is_static) =
         match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
             Ok(r) => r,
-            Err(msg) => {
-                let err = CString::new(msg).unwrap();
-                return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
-            }
+            Err(msg) => return throw_internal_error(ctx, msg),
         };
 
     // 检查是否已 hook — 如果是，直接替换回调（无需 unhook+rehook）
@@ -200,8 +193,7 @@ pub(super) unsafe extern "C" fn js_java_hook(
     let clone_addr = {
         let ptr = libc::malloc(clone_size);
         if ptr.is_null() {
-            let err = CString::new("malloc failed for ArtMethod backup clone").unwrap();
-            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+            return throw_internal_error(ctx, "malloc failed for ArtMethod backup clone");
         }
         std::ptr::copy_nonoverlapping(art_method as *const u8, ptr as *mut u8, clone_size);
         ptr as u64
@@ -218,8 +210,7 @@ pub(super) unsafe extern "C" fn js_java_hook(
     let jni_trampoline = bridge.quick_generic_jni_trampoline;
     if jni_trampoline == 0 {
         libc::free(clone_addr as *mut std::ffi::c_void);
-        let err = CString::new("failed to find art_quick_generic_jni_trampoline").unwrap();
-        return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+        return throw_internal_error(ctx, "failed to find art_quick_generic_jni_trampoline");
     }
 
     // 创建 JNI global ref（callOriginal 用）
@@ -227,9 +218,10 @@ pub(super) unsafe extern "C" fn js_java_hook(
         let cls = find_class_safe(env, &class_name);
         if cls.is_null() {
             libc::free(clone_addr as *mut std::ffi::c_void);
-            let err =
-                CString::new(format!("FindClass('{}') failed for global ref", class_name)).unwrap();
-            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+            return throw_internal_error(
+                ctx,
+                format!("FindClass('{}') failed for global ref", class_name),
+            );
         }
         let new_global_ref: NewGlobalRefFn = jni_fn!(env, NewGlobalRefFn, JNI_NEW_GLOBAL_REF);
         let delete_local_ref: DeleteLocalRefFn =
@@ -269,8 +261,7 @@ pub(super) unsafe extern "C" fn js_java_hook(
                 delete_global_ref(env, class_global_ref as *mut std::ffi::c_void);
             }
         }
-        let err = CString::new("hook_create_native_trampoline failed").unwrap();
-        return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+        return throw_internal_error(ctx, "hook_create_native_trampoline failed");
     }
 
     // 创建 replacement ArtMethod (native method with our thunk)
@@ -286,8 +277,7 @@ pub(super) unsafe extern "C" fn js_java_hook(
                     delete_global_ref(env, class_global_ref as *mut std::ffi::c_void);
                 }
             }
-            let err = CString::new("malloc failed for replacement ArtMethod").unwrap();
-            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+            return throw_internal_error(ctx, "malloc failed for replacement ArtMethod");
         }
         std::ptr::copy_nonoverlapping(art_method as *const u8, ptr as *mut u8, clone_size);
 
@@ -400,8 +390,7 @@ pub(super) unsafe extern "C" fn js_java_hook(
                     delete_global_ref(env, class_global_ref as *mut std::ffi::c_void);
                 }
             }
-            let err = CString::new("hook_install_art_router failed").unwrap();
-            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+            return throw_internal_error(ctx, "hook_install_art_router failed");
         }
 
         // backup_clone.quickCode = trampoline (绕过路由 hook, callOriginal 用)
@@ -533,34 +522,31 @@ pub(super) unsafe extern "C" fn js_java_unhook(
     let method_arg = JSValue(*argv.add(1));
     let sig_arg = JSValue(*argv.add(2));
 
-    let class_name = match class_arg.to_string(ctx) {
-        Some(s) => s,
-        None => {
-            return ffi::JS_ThrowTypeError(
-                ctx,
-                b"Java.unhook() first argument must be a string\0".as_ptr() as *const _,
-            )
-        }
+    let class_name = match extract_string_arg(
+        ctx,
+        class_arg,
+        b"Java.unhook() first argument must be a string\0",
+    ) {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
-    let method_name = match method_arg.to_string(ctx) {
-        Some(s) => s,
-        None => {
-            return ffi::JS_ThrowTypeError(
-                ctx,
-                b"Java.unhook() second argument must be a string\0".as_ptr() as *const _,
-            )
-        }
+    let method_name = match extract_string_arg(
+        ctx,
+        method_arg,
+        b"Java.unhook() second argument must be a string\0",
+    ) {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
-    let sig_str = match sig_arg.to_string(ctx) {
-        Some(s) => s,
-        None => {
-            return ffi::JS_ThrowTypeError(
-                ctx,
-                b"Java.unhook() third argument must be a string\0".as_ptr() as *const _,
-            )
-        }
+    let sig_str = match extract_string_arg(
+        ctx,
+        sig_arg,
+        b"Java.unhook() third argument must be a string\0",
+    ) {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
     // 处理 "static:" 前缀

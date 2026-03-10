@@ -462,34 +462,33 @@ pub(super) unsafe fn marshal_local_java_object_to_js(
 
 #[inline]
 unsafe fn js_throw_type_error(ctx: *mut ffi::JSContext, msg: &[u8]) -> ffi::JSValue {
-    ffi::JS_ThrowTypeError(ctx, msg.as_ptr() as *const _)
+    throw_type_error(ctx, msg)
 }
 
+#[inline]
 unsafe fn js_throw_internal_error(
     ctx: *mut ffi::JSContext,
     message: impl AsRef<str>,
 ) -> ffi::JSValue {
-    let err = CString::new(message.as_ref()).unwrap();
-    ffi::JS_ThrowInternalError(ctx, err.as_ptr())
+    throw_internal_error(ctx, message)
 }
 
 unsafe fn read_invoke_target_ptr(
     ctx: *mut ffi::JSContext,
     arg: JSValue,
 ) -> Result<u64, ffi::JSValue> {
-    let obj_ptr = get_native_pointer_addr(ctx, arg)
-        .or_else(|| arg.to_u64(ctx))
-        .ok_or_else(|| {
-            js_throw_type_error(
-                ctx,
-                b"Java._invokeMethod() first argument must be a pointer (BigUint64/Number/NativePointer)\0",
-            )
-        })?;
+    let obj_ptr = extract_pointer_address(ctx, arg, "Java._invokeMethod").map_err(|_| {
+        ffi::JS_ThrowTypeError(
+            ctx,
+            b"Java._invokeMethod() first argument must be a pointer (BigUint64/Number/NativePointer)\0"
+                .as_ptr() as *const _,
+        )
+    })?;
 
     if obj_ptr == 0 {
-        return Err(js_throw_type_error(
+        return Err(ffi::JS_ThrowTypeError(
             ctx,
-            b"Java._invokeMethod() objPtr is null\0",
+            b"Java._invokeMethod() objPtr is null\0".as_ptr() as *const _,
         ));
     }
 
@@ -501,8 +500,7 @@ unsafe fn read_string_arg(
     arg: JSValue,
     error_msg: &[u8],
 ) -> Result<String, ffi::JSValue> {
-    arg.to_string(ctx)
-        .ok_or_else(|| js_throw_type_error(ctx, error_msg))
+    extract_string_arg(ctx, arg, error_msg)
 }
 
 unsafe fn cleanup_local_refs(
@@ -528,7 +526,7 @@ unsafe fn cleanup_and_throw_internal(
     message: impl AsRef<str>,
 ) -> ffi::JSValue {
     cleanup_local_refs(env, local_obj, cls);
-    js_throw_internal_error(ctx, message)
+    throw_internal_error(ctx, message)
 }
 
 unsafe fn cleanup_and_throw_type(
@@ -539,7 +537,7 @@ unsafe fn cleanup_and_throw_type(
     msg: &[u8],
 ) -> ffi::JSValue {
     cleanup_local_refs(env, local_obj, cls);
-    js_throw_type_error(ctx, msg)
+    ffi::JS_ThrowTypeError(ctx, msg.as_ptr() as *const _)
 }
 
 unsafe fn build_invoke_jargs(

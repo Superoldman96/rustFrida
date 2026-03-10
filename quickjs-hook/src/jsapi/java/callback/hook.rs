@@ -161,8 +161,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
 
             // thisObj for instance methods (x1 = jobject this)
             if !is_static {
-                let val = ffi::JS_NewBigUint64(ctx, hook_ctx.x[1]);
-                JSValue(js_ctx).set_property(ctx, "thisObj", JSValue(val));
+                set_js_u64_property(ctx, js_ctx, "thisObj", hook_ctx.x[1]);
             }
 
             // args[] — ARM64 JNI calling convention (GP x2-x7, FP d0-d7 independent)
@@ -185,29 +184,15 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             }
 
             // env (JNIEnv* — from x0)
-            {
-                let val = ffi::JS_NewBigUint64(ctx, hook_ctx.x[0]);
-                JSValue(js_ctx).set_property(ctx, "env", JSValue(val));
-            }
+            set_js_u64_property(ctx, js_ctx, "env", hook_ctx.x[0]);
 
             // Bind per-callback state to the JS context object so orig()
             // remains valid across nested hook callbacks and JS-side wrappers.
-            {
-                let val = ffi::JS_NewBigUint64(ctx, ctx_ptr as usize as u64);
-                JSValue(js_ctx).set_property(ctx, "__hookCtxPtr", JSValue(val));
-            }
-            {
-                let val = ffi::JS_NewBigUint64(ctx, art_method_addr);
-                JSValue(js_ctx).set_property(ctx, "__hookArtMethod", JSValue(val));
-            }
+            set_js_u64_property(ctx, js_ctx, "__hookCtxPtr", ctx_ptr as usize as u64);
+            set_js_u64_property(ctx, js_ctx, "__hookArtMethod", art_method_addr);
 
             // orig()
-            {
-                let cname = CString::new("orig").unwrap();
-                let func_val =
-                    ffi::qjs_new_cfunction(ctx, Some(js_call_original), cname.as_ptr(), 0);
-                JSValue(js_ctx).set_property(ctx, "orig", JSValue(func_val));
-            }
+            set_js_cfunction_property(ctx, js_ctx, "orig", js_call_original, 0);
 
             js_ctx
         },
@@ -239,17 +224,11 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                         if !env.is_null() {
                             marshal_js_to_jvalue(ctx, env, result_val, Some(&return_type_sig))
                         } else {
-                            result_val.to_u64(ctx).unwrap_or(0)
+                            js_value_to_u64_or_zero(ctx, result_val)
                         }
                     }
                     _ => {
-                        if let Some(v) = result_val.to_u64(ctx) {
-                            v
-                        } else if let Some(v) = result_val.to_i64(ctx) {
-                            v as u64
-                        } else {
-                            0u64
-                        }
+                        js_value_to_u64_or_zero(ctx, result_val)
                     }
                 };
                 (*ctx_ptr).x[0] = ret_u64;
