@@ -5,6 +5,7 @@ members = [
     "frida-gum",
     "rust_frida",
     "agent",
+    "qbdi-helper",
     "ldmonitor",
     "ldmonitor-common",
     "ldmonitor-ebpf",

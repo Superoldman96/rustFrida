@@ -2,6 +2,8 @@
 
 mod callback;
 mod functions;
+#[cfg(feature = "qbdi")]
+mod qbdi;
 mod registry;
 
 use crate::context::JSContext;
@@ -11,6 +13,10 @@ use crate::jsapi::util::add_cfunction_to_object;
 use callback::{in_flight_native_hook_callbacks, wait_for_in_flight_native_hook_callbacks};
 use functions::{js_call_native, js_hook, js_unhook};
 use registry::HOOK_REGISTRY;
+#[cfg(feature = "qbdi")]
+pub use qbdi::preload_qbdi_helper;
+#[cfg(feature = "qbdi")]
+pub use qbdi::shutdown_qbdi_helper;
 
 /// Register hook API
 pub fn register_hook_api(ctx: &JSContext) {
@@ -21,6 +27,13 @@ pub fn register_hook_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx.as_ptr(), g, "hook", js_hook, 3);
         add_cfunction_to_object(ctx.as_ptr(), g, "unhook", js_unhook, 1);
         add_cfunction_to_object(ctx.as_ptr(), g, "callNative", js_call_native, 1);
+    }
+
+    #[cfg(feature = "qbdi")]
+    {
+        let qbdi = ctx.new_object();
+        qbdi::register_qbdi_api(ctx.as_ptr(), qbdi.raw());
+        global.set_property(ctx.as_ptr(), "qbdi", qbdi);
     }
 
     global.free(ctx.as_ptr());

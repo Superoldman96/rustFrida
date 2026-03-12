@@ -365,6 +365,10 @@ pub(crate) enum DebugInjectMode {
     MemfdOnly,
     /// 仅 dlopen agent.so（测试 memfd 映射检测）
     SoOnly,
+    /// 仅 dlopen qbdi-helper.so（隔离验证 QBDI helper hide_soinfo）
+    #[cfg(feature = "qbdi")]
+    #[value(name = "qbdi-helper")]
+    QbdiHelper,
     /// dlopen 空 SO（测试 memfd 映射本身是否被检测，排除 SO 内容因素）
     SoEmpty,
     /// dlopen + socketpair（测试 maps + fd 检测）
@@ -383,6 +387,8 @@ impl DebugInjectMode {
             Self::PtraceOnly => "仅 ptrace attach + malloc + detach",
             Self::MemfdOnly => "仅 memfd_create + 写入 + 关闭（不 dlopen）",
             Self::SoOnly => "仅 dlopen agent.so",
+            #[cfg(feature = "qbdi")]
+            Self::QbdiHelper => "仅 dlopen qbdi-helper.so",
             Self::SoEmpty => "dlopen 空 SO（排除内容检测）",
             Self::SoFd => "dlopen + socketpair",
             Self::SoFdThread => "完整注入（不启动 REPL）",
@@ -391,10 +397,14 @@ impl DebugInjectMode {
     }
 
     pub(crate) fn needs_dlopen(&self) -> bool {
-        matches!(
-            self,
-            Self::SoOnly | Self::SoEmpty | Self::SoFd | Self::SoFdThread
-        )
+        if matches!(self, Self::SoOnly | Self::SoEmpty | Self::SoFd | Self::SoFdThread) {
+            return true;
+        }
+        #[cfg(feature = "qbdi")]
+        if matches!(self, Self::QbdiHelper) {
+            return true;
+        }
+        false
     }
 
     pub(crate) fn needs_socketpair(&self) -> bool {
@@ -404,6 +414,11 @@ impl DebugInjectMode {
     /// 是否使用空 SO 代替 agent.so
     pub(crate) fn use_empty_so(&self) -> bool {
         matches!(self, Self::SoEmpty)
+    }
+
+    #[cfg(feature = "qbdi")]
+    pub(crate) fn use_qbdi_helper_so(&self) -> bool {
+        matches!(self, Self::QbdiHelper)
     }
 }
 
@@ -497,6 +512,7 @@ fn dlopen_agent_via_ptrace(
     target_memfd: i32,
     offsets: &LibcOffsets,
     dl_offsets: &DlOffsets,
+    lib_name: &str,
 ) -> Result<usize, String> {
     // 在目标进程中先通过 dlopen+dlsym 解析真实 android_dlopen_ext 地址，
     // 避免用本进程 libdl 偏移平移后落到错误地址。
@@ -524,10 +540,11 @@ fn dlopen_agent_via_ptrace(
     log_verbose!("目标进程 android_dlopen_ext = 0x{:x}", android_dlopen_ext_addr);
 
     // 在目标进程中分配并写入 lib name 字符串
-    let lib_name = b"agent.so\0";
-    let name_addr = call_target_function(pid, offsets.malloc, &[lib_name.len()], None)
+    let mut lib_name_buf = lib_name.as_bytes().to_vec();
+    lib_name_buf.push(0);
+    let name_addr = call_target_function(pid, offsets.malloc, &[lib_name_buf.len()], None)
         .map_err(|e| format!("分配 lib_name 内存失败: {}", e))?;
-    write_bytes(pid, name_addr, lib_name)?;
+    write_bytes(pid, name_addr, &lib_name_buf)?;
 
     // 构造 android_dlextinfo
     let ext_info = AndroidDlextinfo {
@@ -682,23 +699,32 @@ pub(crate) fn inject_debug(
     // dlopen SO（so-only / so-empty / so+fd）
     if mode.needs_dlopen() {
         let dl = dl_offsets.as_ref().unwrap();
-        let (so_data, label): (&[u8], &str) = if mode.use_empty_so() {
-            (EMPTY_SO, "empty.so")
+        let (so_data, label, hide_result_sym): (&[u8], &str, &[u8]) = if mode.use_empty_so() {
+            (EMPTY_SO, "empty.so", b"")
         } else {
-            (AGENT_SO, "agent.so")
+            #[cfg(feature = "qbdi")]
+            if mode.use_qbdi_helper_so() {
+                (QBDI_HELPER_SO, "qbdi_helper.so", b"rust_get_hide_result\0")
+            } else {
+                (AGENT_SO, "agent.so", b"rust_get_hide_result\0")
+            }
+            #[cfg(not(feature = "qbdi"))]
+            {
+                (AGENT_SO, "agent.so", b"rust_get_hide_result\0")
+            }
         };
         let target_memfd = create_and_fill_memfd(pid, &offsets, so_data, label)?;
-        let handle = dlopen_agent_via_ptrace(pid, target_memfd, &offsets, dl)?;
+        let handle = dlopen_agent_via_ptrace(pid, target_memfd, &offsets, dl, label)?;
         // 关闭 memfd（SO 已加载，memfd 不再需要）
         let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);
         log_success!("{} dlopen 完成", label);
 
         // 读取 hide_soinfo 结果（仅非空 SO）
         if !mode.use_empty_so() && handle != 0 {
-            let sym_name = b"rust_get_hide_result\0";
-            let sym_addr = call_target_function(pid, offsets.malloc, &[sym_name.len()], None).ok();
+            let sym_addr =
+                call_target_function(pid, offsets.malloc, &[hide_result_sym.len()], None).ok();
             if let Some(sym_addr) = sym_addr {
-                let _ = write_bytes(pid, sym_addr, sym_name);
+                let _ = write_bytes(pid, sym_addr, hide_result_sym);
                 if let Ok(fn_ptr) = call_target_function(pid, dl.dlsym, &[handle, sym_addr], None) {
                     let _ = call_target_function(pid, offsets.free, &[sym_addr], None);
                     if fn_ptr != 0 {
@@ -743,7 +769,9 @@ pub(crate) fn inject_debug(
                             }
                         }
                     } else {
-                        log_warn!("dlsym(rust_get_hide_result) 返回 NULL");
+                        let sym_name = std::str::from_utf8(&hide_result_sym[..hide_result_sym.len() - 1])
+                            .unwrap_or("<invalid>");
+                        log_warn!("dlsym({}) 返回 NULL", sym_name);
                     }
                 } else {
                     let _ = call_target_function(pid, offsets.free, &[sym_addr], None);

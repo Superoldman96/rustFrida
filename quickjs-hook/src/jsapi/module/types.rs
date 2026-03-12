@@ -73,6 +73,15 @@ const SHT_STRTAB: u32 = 3;
 struct UnrestrictedLinkerApi {
     /// __dl___loader_dlopen(filename, flags, caller_addr) -> handle
     dlopen: unsafe extern "C" fn(*const i8, i32, *const std::ffi::c_void) -> *mut std::ffi::c_void,
+    /// __dl___loader_android_dlopen_ext(filename, flags, extinfo, caller_addr) -> handle
+    android_dlopen_ext: Option<
+        unsafe extern "C" fn(
+            *const i8,
+            i32,
+            *const std::ffi::c_void,
+            *const std::ffi::c_void,
+        ) -> *mut std::ffi::c_void,
+    >,
     /// __dl___loader_dlvsym(handle, symbol, version, caller_addr) -> addr
     dlsym: unsafe extern "C" fn(
         *mut std::ffi::c_void,
@@ -111,4 +120,3 @@ pub(crate) static LIBART_RANGE: std::sync::OnceLock<(u64, u64)> = std::sync::Onc
 
 /// Cached libart.so full file path.
 static LIBART_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-

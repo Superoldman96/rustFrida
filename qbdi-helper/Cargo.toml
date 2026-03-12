@@ -1,0 +1,19 @@
+[package]
+name = "qbdi-helper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+qbdi = { path = "../qbdi" }
+crossbeam-channel = "0.5"
+lazy_static = "1.5.0"
+prost = "0.13"
+
+[build-dependencies]
+cc = "1.2.29"
+
+[lib]
+name = "qbdi_helper"
+crate-type = ["cdylib"]
+path = "src/lib.rs"

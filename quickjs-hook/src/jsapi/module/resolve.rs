@@ -2,6 +2,17 @@
 // Module handle + symbol resolution
 // ============================================================================
 
+#[repr(C)]
+struct AndroidDlextinfo {
+    flags: u64,
+    reserved_addr: u64,
+    reserved_size: u64,
+    relro_fd: i32,
+    library_fd: i32,
+    library_fd_offset: u64,
+    library_namespace: u64,
+}
+
 /// Get a dlopen handle to libart.so via unrestricted linker API (Frida-style).
 unsafe fn get_libart_handle() -> *mut std::ffi::c_void {
     LIBART_HANDLE
@@ -115,6 +126,37 @@ pub(crate) unsafe fn module_dlsym(module_name: &str, symbol: &str) -> *mut std::
             if !addr.is_null() {
                 return addr;
             }
+        }
+    }
+
+    std::ptr::null_mut()
+}
+
+/// Load a shared object from an existing memfd using the linker's trusted-caller API.
+pub(crate) unsafe fn memfd_dlopen(name: &str, fd: i32) -> *mut std::ffi::c_void {
+    let c_name = match CString::new(name) {
+        Ok(value) => value,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
+    if let Some(api) = api {
+        if let Some(android_dlopen_ext) = api.android_dlopen_ext {
+            let extinfo = AndroidDlextinfo {
+                flags: 0x10,
+                reserved_addr: 0,
+                reserved_size: 0,
+                relro_fd: 0,
+                library_fd: fd,
+                library_fd_offset: 0,
+                library_namespace: 0,
+            };
+            return android_dlopen_ext(
+                c_name.as_ptr() as *const i8,
+                libc::RTLD_NOW,
+                &extinfo as *const _ as *const std::ffi::c_void,
+                api.trusted_caller,
+            );
         }
     }
 

@@ -74,15 +74,15 @@ fn main() {
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write bindings!");
 
-    // Link the static library
-    println!("cargo:rustc-link-search=native={}", lib_path.display());
-    println!("cargo:rustc-link-lib=static=QBDI");
-    println!("cargo:rustc-link-lib=c++");
-    println!("cargo:rustc-link-lib=log");
+    // Native link directives are intentionally emitted by the final cdylib
+    // consumer (currently qbdi-helper). Propagating static archives from this
+    // rlib causes Android's linker to pull libc.a internals into the helper.
 
     // Rerun if headers change
     println!("cargo:rerun-if-changed={}/libQBDI.a", lib_path.display());
     println!("cargo:rerun-if-changed={}/QBDI.h", manifest_dir);
     println!("cargo:rerun-if-changed={}/QBDI/", manifest_dir);
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=NDK_PATH");
+    println!("cargo:rerun-if-env-changed=ANDROID_NDK_HOME");
 }
