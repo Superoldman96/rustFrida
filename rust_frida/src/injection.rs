@@ -27,7 +27,7 @@ pub(crate) const AGENT_SO: &[u8] =
 pub(crate) const QBDI_HELPER_SO: &[u8] = include_bytes!(env!("QBDI_HELPER_SO_PATH"));
 
 /// 最小化空 SO（无符号、无 .init_array），用于隔离 memfd 映射检测
-const EMPTY_SO: &[u8] = include_bytes!("../../loader/build/empty.so");
+const EMPTY_SO: &[u8] = include_bytes!("../../loader/build/loader.bin");
 
 /// 在目标进程中分配内存并写入结构体，返回远程地址。
 fn alloc_and_write_struct<T>(
