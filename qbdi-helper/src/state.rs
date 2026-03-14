@@ -1,8 +1,9 @@
 use crossbeam_channel::Sender;
 use lazy_static::lazy_static;
+use crate::data::TraceBundleMetadata;
 use qbdi::{VM, VirtualStack};
 use std::collections::HashMap;
-use std::ffi::c_char;
+use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -13,7 +14,6 @@ pub(crate) const TRACE_MAX_PENDING_BYTES: usize = 1024 * 1024 * 1024;
 pub(crate) const TRACE_PROGRESS_EVERY: u64 = 1_000;
 pub(crate) const TRACE_CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TRACE_SHARDS: usize = 4;
-pub(crate) const TRACE_STACK_SIZE: u32 = 0x100000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExecMap {
@@ -76,6 +76,7 @@ impl TraceQueueBudget {
 
 pub(crate) static TRACE_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 pub(crate) static LAST_ERROR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+pub(crate) static TRACE_BUNDLE_METADATA: Mutex<Option<TraceBundleMetadata>> = Mutex::new(None);
 pub(crate) static TRACE_WRITER: Mutex<Option<TraceWriter>> = Mutex::new(None);
 pub(crate) static TRACE_FINALIZERS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 pub(crate) static TRACE_NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -186,6 +187,47 @@ pub extern "C" fn qbdi_trace_last_error() -> *const c_char {
 
 pub(crate) fn set_trace_output_dir(path: &str) {
     let _ = TRACE_OUTPUT_DIR.set(path.to_string());
+}
+
+pub(crate) fn set_trace_bundle_metadata(module_path: String, module_base: u64) {
+    *TRACE_BUNDLE_METADATA
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(TraceBundleMetadata {
+        module_path,
+        module_base,
+    });
+}
+
+pub(crate) fn get_trace_bundle_metadata() -> Option<TraceBundleMetadata> {
+    TRACE_BUNDLE_METADATA
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+#[no_mangle]
+pub extern "C" fn qbdi_trace_set_bundle_metadata(
+    module_path: *const c_char,
+    module_base: u64,
+) -> i32 {
+    clear_last_error();
+    if module_path.is_null() {
+        set_last_error("module_path is null");
+        return -1;
+    }
+    let module_path = match unsafe { CStr::from_ptr(module_path) }.to_str() {
+        Ok(path) if !path.is_empty() => path,
+        Ok(_) => {
+            set_last_error("empty module_path");
+            return -1;
+        }
+        Err(_) => {
+            set_last_error("invalid module_path");
+            return -1;
+        }
+    };
+    set_trace_bundle_metadata(module_path.to_string(), module_base);
+    0
 }
 
 pub(crate) fn helper_log(msg: &str) {

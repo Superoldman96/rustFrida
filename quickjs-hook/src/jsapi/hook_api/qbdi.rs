@@ -35,6 +35,7 @@ type VmSetFprFn = unsafe extern "C" fn(u64, u32, u64, u64) -> c_int;
 type VmGetErrnoFn = unsafe extern "C" fn(u64, *mut u32) -> c_int;
 type VmSetErrnoFn = unsafe extern "C" fn(u64, u32) -> c_int;
 type VmTraceRegisterFn = unsafe extern "C" fn(u64, u64, *const c_char) -> c_int;
+type TraceBundleMetadataFn = unsafe extern "C" fn(*const c_char, u64) -> c_int;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -82,6 +83,7 @@ struct HelperApi {
     vm_set_fpr: VmSetFprFn,
     vm_get_errno: VmGetErrnoFn,
     vm_set_errno: VmSetErrnoFn,
+    trace_set_bundle_metadata: TraceBundleMetadataFn,
     vm_register_trace_callbacks: VmTraceRegisterFn,
     vm_unregister_trace_callbacks: VmUnaryFn,
 }
@@ -205,6 +207,7 @@ unsafe fn build_helper_api(handle: *mut c_void) -> Result<HelperApi, String> {
         vm_set_fpr: std::mem::transmute(required("qbdi_vm_set_fpr")?),
         vm_get_errno: std::mem::transmute(required("qbdi_vm_get_errno")?),
         vm_set_errno: std::mem::transmute(required("qbdi_vm_set_errno")?),
+        trace_set_bundle_metadata: std::mem::transmute(required("qbdi_trace_set_bundle_metadata")?),
         vm_register_trace_callbacks: std::mem::transmute(required("qbdi_vm_register_trace_callbacks")?),
         vm_unregister_trace_callbacks: std::mem::transmute(required("qbdi_vm_unregister_trace_callbacks")?),
     })
@@ -827,6 +830,23 @@ js_bool_method!(js_qbdi_set_errno, 2, |ctx, argc, argv| {
     bool_from_rc((api.vm_set_errno)(handle, value))
 });
 
+js_bool_method!(js_qbdi_set_trace_bundle_metadata, 2, |ctx, argc, argv| {
+    let api = match load_qbdi_helper() {
+        Ok(api) => api,
+        Err(err) => return throw_internal_error(ctx, err),
+    };
+    let module_path = match extract_string_arg_owned(ctx, argv, 0, "qbdi.setTraceBundleMetadata") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let module_base = match extract_u64_arg(ctx, argv, 1, "qbdi.setTraceBundleMetadata") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let c_path = CString::new(module_path).unwrap();
+    bool_from_rc((api.trace_set_bundle_metadata)(c_path.as_ptr(), module_base))
+});
+
 js_bool_method!(js_qbdi_register_trace_callbacks, 2, |ctx, argc, argv| {
     let api = match load_qbdi_helper() {
         Ok(api) => api,
@@ -917,6 +937,7 @@ pub fn register_qbdi_api(ctx: *mut ffi::JSContext, qbdi_obj: ffi::JSValue) {
         add_cfunction_to_object(ctx, qbdi_obj, "setFPR", js_qbdi_set_fpr, 4);
         add_cfunction_to_object(ctx, qbdi_obj, "getErrno", js_qbdi_get_errno, 1);
         add_cfunction_to_object(ctx, qbdi_obj, "setErrno", js_qbdi_set_errno, 2);
+        add_cfunction_to_object(ctx, qbdi_obj, "setTraceBundleMetadata", js_qbdi_set_trace_bundle_metadata, 2);
         add_cfunction_to_object(ctx, qbdi_obj, "registerTraceCallbacks", js_qbdi_register_trace_callbacks, 2);
         add_cfunction_to_object(ctx, qbdi_obj, "unregisterTraceCallbacks", js_qbdi_unregister_trace_callbacks, 1);
         add_cfunction_to_object(ctx, qbdi_obj, "lastError", js_qbdi_last_error, 0);

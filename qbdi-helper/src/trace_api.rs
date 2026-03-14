@@ -3,20 +3,20 @@ use crate::data::{
     TraceContext,
 };
 use crate::state::{
-    clear_last_error, helper_log, set_last_error, set_trace_output_dir, ExecMap,
+    clear_last_error, get_trace_bundle_metadata, helper_log, set_last_error,
+    set_trace_output_dir, ExecMap,
     ADDED_DYNAMIC_RANGES, DUMPED_DYNAMIC_RANGES, TRACE_EXECUTED_INSTRUCTIONS,
-    DYNAMIC_EXEC_CHUNK_SIZE, TRACE_PROGRESS_EVERY, TRACE_STACK_SIZE,
+    DYNAMIC_EXEC_CHUNK_SIZE, TRACE_PROGRESS_EVERY,
 };
 use crate::writer::{
-    finalize_trace_session_async, flush_thread_local_chunk, shutdown_trace_writer,
-    start_trace_writer, trace_send,
+    finalize_trace_session_async, shutdown_trace_writer, start_trace_writer, trace_send,
 };
 use qbdi::ffi::{
     qbdi_addInstrumentedRange, InstPosition_QBDI_PREINST, MemoryAccessType_QBDI_MEMORY_READ,
     VMAction_QBDI_CONTINUE, VMEvent_QBDI_EXEC_TRANSFER_CALL,
     VMEvent_QBDI_EXEC_TRANSFER_RETURN, VMInstanceRef,
 };
-use qbdi::{simulate_call, FPRState, GPRState, VMAction, VMRef, VM, VirtualStack};
+use qbdi::{FPRState, GPRState, VMAction, VMRef, VM};
 use std::ffi::{c_char, c_void, CStr};
 use std::os::unix::fs::FileExt;
 use std::ptr::null_mut;
@@ -139,25 +139,11 @@ fn find_exec_map(target: u64) -> Option<ExecMap> {
         .find(|entry| target >= entry.start && target < entry.end)
 }
 
-fn is_special_kernel_map(path: &str) -> bool {
-    matches!(path, "[vdso]" | "[vectors]" | "[vsyscall]" | "[sigpage]")
-}
-
 fn is_dynamic_exec_map(map: &ExecMap) -> bool {
     if !is_executable(&map.perms) {
         return false;
     }
-    if map.path.is_empty() {
-        return true;
-    }
-    if map.path.starts_with("[anon:")
-        || map.path.starts_with("/dev/ashmem")
-        || map.path.contains("memfd:")
-        || map.path.ends_with(" (deleted)")
-    {
-        return true;
-    }
-    map.path.starts_with('[') && !is_special_kernel_map(&map.path)
+    map.path.is_empty() || map.path.starts_with("[anon:")
 }
 
 pub(crate) fn collect_exec_ranges(target: u64) -> Result<Vec<ExecMap>, String> {
@@ -167,8 +153,7 @@ pub(crate) fn collect_exec_ranges(target: u64) -> Result<Vec<ExecMap>, String> {
         .find(|entry| target >= entry.start && target < entry.end)
         .ok_or_else(|| format!("target {:#x} not found in /proc/self/maps", target))?;
 
-    let mut ranges: Vec<ExecMap> = if !containing.path.is_empty() && !is_dynamic_exec_map(containing)
-    {
+    let ranges: Vec<ExecMap> = if !containing.path.is_empty() && !is_dynamic_exec_map(containing) {
         entries
             .iter()
             .filter(|entry| entry.path == containing.path && is_executable(&entry.perms))
@@ -177,15 +162,6 @@ pub(crate) fn collect_exec_ranges(target: u64) -> Result<Vec<ExecMap>, String> {
     } else {
         vec![containing.clone()]
     };
-
-    for entry in entries.into_iter().filter(is_dynamic_exec_map) {
-        if !ranges
-            .iter()
-            .any(|existing| existing.start == entry.start && existing.end == entry.end)
-        {
-            ranges.push(entry);
-        }
-    }
 
     if ranges.is_empty() {
         Err(format!("no executable range found for target {:#x}", target))
@@ -310,21 +286,6 @@ extern "C" fn exec_transfer_call_cb(
     VMAction_QBDI_CONTINUE
 }
 
-fn setup_simulated_call_context(vm: &VM, args: &[u64]) -> Result<VirtualStack, String> {
-    let gpr = vm.gpr_state().ok_or_else(|| "QBDI GPRState is null".to_string())?;
-    *gpr = GPRState::new();
-
-    let stack = VirtualStack::new(gpr as *mut GPRState, TRACE_STACK_SIZE)
-        .ok_or_else(|| format!("QBDI allocateVirtualStack({:#x}) failed", TRACE_STACK_SIZE))?;
-
-    simulate_call(gpr, 0, args);
-
-    let fpr = vm.fpr_state();
-    *fpr = FPRState::new();
-
-    Ok(stack)
-}
-
 fn snapshot_trace_context(vm: &VM, target: u64) -> Result<TraceContext, String> {
     let gpr = vm.gpr_state().ok_or_else(|| "QBDI GPRState is null".to_string())?;
     let fpr = vm.fpr_state();
@@ -359,6 +320,35 @@ fn snapshot_trace_context(vm: &VM, target: u64) -> Result<TraceContext, String> 
     })
 }
 
+fn infer_trace_bundle_metadata(target: u64) -> Option<crate::data::TraceBundleMetadata> {
+    let containing = find_exec_map(target)?;
+    if containing.path.is_empty() || is_dynamic_exec_map(&containing) {
+        return None;
+    }
+
+    let module_base = read_exec_maps()
+        .ok()?
+        .into_iter()
+        .filter(|entry| entry.path == containing.path && is_executable(&entry.perms))
+        .map(|entry| entry.start)
+        .min()
+        .unwrap_or(containing.start);
+
+    Some(crate::data::TraceBundleMetadata {
+        module_path: containing.path,
+        module_base,
+    })
+}
+
+fn emit_trace_bundle_metadata(target: u64) {
+    let metadata = get_trace_bundle_metadata().or_else(|| infer_trace_bundle_metadata(target));
+    if let Some(metadata) = metadata {
+        trace_send(TraceBundleEvent {
+            kind: Some(TraceBundleEventKind::TraceBundleMetadata(metadata)),
+        });
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 fn read_tpidr_el0() -> u64 {
     let value: u64;
@@ -371,107 +361,6 @@ fn read_tpidr_el0() -> u64 {
 #[cfg(not(target_arch = "aarch64"))]
 fn read_tpidr_el0() -> u64 {
     0
-}
-
-fn run_hook_trace_impl(args: &[u64], target: u64) -> Result<u64, String> {
-    {
-        ADDED_DYNAMIC_RANGES.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        DUMPED_DYNAMIC_RANGES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-    }
-    let ranges = collect_exec_ranges(target)?;
-    let vm = VM::new();
-    for map in &ranges {
-        vm.add_instrumented_range(map.start, map.end);
-        if is_dynamic_exec_map(map) {
-            ADDED_DYNAMIC_RANGES
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert((map.start, map.end));
-            dump_dynamic_exec_map(map);
-        }
-    }
-    let _stack = setup_simulated_call_context(&vm, args)?;
-    trace_send(TraceBundleEvent {
-        kind: Some(TraceBundleEventKind::TraceContext(snapshot_trace_context(&vm, target)?)),
-    });
-    vm.add_code_cb(InstPosition_QBDI_PREINST, Some(qbdicb), null_mut(), 0);
-    let _ = vm.record_memory_access(MemoryAccessType_QBDI_MEMORY_READ);
-    vm.add_mem_access_cb(
-        MemoryAccessType_QBDI_MEMORY_READ,
-        Some(mem_acc_cb),
-        null_mut(),
-        0,
-    );
-    vm.add_vm_event_cb(
-        VMEvent_QBDI_EXEC_TRANSFER_CALL,
-        Some(exec_transfer_call_cb),
-        null_mut(),
-    );
-    vm.add_vm_event_cb(
-        VMEvent_QBDI_EXEC_TRANSFER_RETURN,
-        Some(exec_transfer_return_cb),
-        null_mut(),
-    );
-    if !vm.run(target, 0) {
-        return Err(format!("QBDI vm.run({:#x}) failed", target));
-    }
-    flush_thread_local_chunk();
-    vm.gpr_state()
-        .map(|gpr| gpr.x0)
-        .ok_or_else(|| "QBDI GPRState missing after run".to_string())
-}
-
-#[no_mangle]
-pub extern "C" fn qbdi_trace_run(
-    args_ptr: *const u64,
-    args_len: u32,
-    target: u64,
-    output_dir: *const c_char,
-    result_out: *mut u64,
-) -> i32 {
-    clear_last_error();
-    if output_dir.is_null() || result_out.is_null() {
-        set_last_error("invalid arguments");
-        return -1;
-    }
-    let args = match crate::state::decode_args(args_ptr, args_len) {
-        Ok(args) => args,
-        Err(err) => {
-            set_last_error(err);
-            return -1;
-        }
-    };
-    let output_dir = unsafe { CStr::from_ptr(output_dir) }
-        .to_str()
-        .map_err(|_| "invalid output_dir")
-        .and_then(|path| if path.is_empty() { Err("empty output_dir") } else { Ok(path) });
-    let output_dir = match output_dir {
-        Ok(path) => path,
-        Err(msg) => {
-            set_last_error(msg);
-            return -1;
-        }
-    };
-    set_trace_output_dir(output_dir);
-    if let Err(err) = start_trace_writer() {
-        set_last_error(err);
-        return -1;
-    }
-    match run_hook_trace_impl(args, target) {
-        Ok(value) => {
-            finalize_trace_session_async();
-            unsafe { *result_out = value; }
-            0
-        }
-        Err(err) => {
-            finalize_trace_session_async();
-            set_last_error(&err);
-            -1
-        }
-    }
 }
 
 #[no_mangle]
@@ -519,15 +408,9 @@ pub extern "C" fn qbdi_vm_register_trace_callbacks(
         let ranges = collect_exec_ranges(target)?;
         for map in &ranges {
             managed.vm.add_instrumented_range(map.start, map.end);
-            if is_dynamic_exec_map(map) {
-                ADDED_DYNAMIC_RANGES
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert((map.start, map.end));
-                dump_dynamic_exec_map(map);
-            }
         }
 
+        emit_trace_bundle_metadata(target);
         trace_send(TraceBundleEvent {
             kind: Some(TraceBundleEventKind::TraceContext(snapshot_trace_context(&managed.vm, target)?)),
         });
