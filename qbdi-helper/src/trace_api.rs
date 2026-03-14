@@ -3,17 +3,16 @@ use crate::data::{
     TraceContext,
 };
 use crate::state::{
-    clear_last_error, get_trace_bundle_metadata, helper_log, set_last_error,
-    set_trace_output_dir, ExecMap,
-    ADDED_DYNAMIC_RANGES, DUMPED_DYNAMIC_RANGES, TRACE_EXECUTED_INSTRUCTIONS,
-    DYNAMIC_EXEC_CHUNK_SIZE, TRACE_PROGRESS_EVERY,
+    clear_last_error, get_trace_bundle_metadata, helper_log, set_last_error, set_trace_output_dir,
+    ExecMap, ADDED_DYNAMIC_RANGES, DUMPED_DYNAMIC_RANGES, DYNAMIC_EXEC_CHUNK_SIZE,
+    TRACE_EXECUTED_INSTRUCTIONS, TRACE_PROGRESS_EVERY,
 };
 use crate::writer::{
     finalize_trace_session_async, shutdown_trace_writer, start_trace_writer, trace_send,
 };
 use qbdi::ffi::{
     qbdi_addInstrumentedRange, InstPosition_QBDI_PREINST, MemoryAccessType_QBDI_MEMORY_READ,
-    VMAction_QBDI_CONTINUE, VMEvent_QBDI_EXEC_TRANSFER_CALL,
+    VMAction_QBDI_BREAK_TO_VM, VMAction_QBDI_CONTINUE, VMEvent_QBDI_EXEC_TRANSFER_CALL,
     VMEvent_QBDI_EXEC_TRANSFER_RETURN, VMInstanceRef,
 };
 use qbdi::{FPRState, GPRState, VMAction, VMRef, VM};
@@ -37,7 +36,8 @@ extern "C" fn qbdicb(
             if count % TRACE_PROGRESS_EVERY == 0 {
                 helper_log(&format!(
                     "[qbdi-helper] trace progress: instructions={} pc={:#x}",
-                    count, (*gpr_state).pc
+                    count,
+                    (*gpr_state).pc
                 ));
             }
         }
@@ -164,7 +164,10 @@ pub(crate) fn collect_exec_ranges(target: u64) -> Result<Vec<ExecMap>, String> {
     };
 
     if ranges.is_empty() {
-        Err(format!("no executable range found for target {:#x}", target))
+        Err(format!(
+            "no executable range found for target {:#x}",
+            target
+        ))
     } else {
         Ok(ranges)
     }
@@ -185,20 +188,6 @@ fn perms_to_u32(perms: &str) -> u32 {
     prot
 }
 
-fn sanitize_path_component(path: &str) -> String {
-    let trimmed = if path.is_empty() { "anon" } else { path };
-    trimmed
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 pub(crate) fn dump_dynamic_exec_map(map: &ExecMap) {
     if !is_dynamic_exec_map(map) {
         return;
@@ -209,9 +198,6 @@ pub(crate) fn dump_dynamic_exec_map(map: &ExecMap) {
             return;
         }
     }
-    let Some(base) = crate::state::TRACE_OUTPUT_DIR.get() else {
-        return;
-    };
     let Ok(mem_file) = std::fs::File::open("/proc/self/mem") else {
         return;
     };
@@ -240,22 +226,15 @@ pub(crate) fn dump_dynamic_exec_map(map: &ExecMap) {
             })),
         });
     }
-
-    let file_path = format!(
-        "{}/qbdi_mmap_{:x}_{:x}_{}.bin",
-        base,
-        map.start,
-        map.end,
-        sanitize_path_component(&map.path)
-    );
-    let _ = std::fs::write(&file_path, &data);
 }
 
 pub(crate) fn ensure_dynamic_exec_range_instrumented(vm: VMInstanceRef, map: &ExecMap) {
     if !is_dynamic_exec_map(map) {
         return;
     }
-    let mut added = ADDED_DYNAMIC_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut added = ADDED_DYNAMIC_RANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if added.insert((map.start, map.end)) {
         unsafe {
             qbdi_addInstrumentedRange(vm, map.start, map.end);
@@ -265,29 +244,35 @@ pub(crate) fn ensure_dynamic_exec_range_instrumented(vm: VMInstanceRef, map: &Ex
 
 extern "C" fn exec_transfer_call_cb(
     vm: VMInstanceRef,
-    event: *const qbdi::ffi::VMState,
-    _gpr: *mut GPRState,
+    _event: *const qbdi::ffi::VMState,
+    gpr: *mut GPRState,
     _fpr: *mut FPRState,
     _data: *mut c_void,
 ) -> VMAction {
     unsafe {
-        if event.is_null() {
+        if gpr.is_null() {
             return VMAction_QBDI_CONTINUE;
         }
-        let dest = (*event).basicBlockStart;
+        let dest = (*gpr).pc;
         if let Some(map) = find_exec_map(dest) {
             if !is_dynamic_exec_map(&map) {
                 return VMAction_QBDI_CONTINUE;
             }
             ensure_dynamic_exec_range_instrumented(vm, &map);
             dump_dynamic_exec_map(&map);
+            // BREAK_TO_VM 强制 QBDI 重新评估执行状态，
+            // 使新加入的 instrumented range 立即生效，
+            // 否则本次调用仍以 native 方式执行，trace 不到动态区域的指令
+            return VMAction_QBDI_BREAK_TO_VM;
         }
     }
     VMAction_QBDI_CONTINUE
 }
 
 fn snapshot_trace_context(vm: &VM, target: u64) -> Result<TraceContext, String> {
-    let gpr = vm.gpr_state().ok_or_else(|| "QBDI GPRState is null".to_string())?;
+    let gpr = vm
+        .gpr_state()
+        .ok_or_else(|| "QBDI GPRState is null".to_string())?;
     let fpr = vm.fpr_state();
     let tpidr_el0 = read_tpidr_el0();
 
@@ -399,7 +384,10 @@ pub extern "C" fn qbdi_vm_register_trace_callbacks(
     let result = crate::state::with_vm(handle, |managed| {
         managed.vm.delete_all_instrumentations();
         managed.trace_callback_ids.clear();
-        ADDED_DYNAMIC_RANGES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        ADDED_DYNAMIC_RANGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         DUMPED_DYNAMIC_RANGES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -412,13 +400,19 @@ pub extern "C" fn qbdi_vm_register_trace_callbacks(
 
         emit_trace_bundle_metadata(target);
         trace_send(TraceBundleEvent {
-            kind: Some(TraceBundleEventKind::TraceContext(snapshot_trace_context(&managed.vm, target)?)),
+            kind: Some(TraceBundleEventKind::TraceContext(snapshot_trace_context(
+                &managed.vm,
+                target,
+            )?)),
         });
 
-        let code_cb = managed
+        let code_cb =
+            managed
+                .vm
+                .add_code_cb(InstPosition_QBDI_PREINST, Some(qbdicb), null_mut(), 0);
+        let _ = managed
             .vm
-            .add_code_cb(InstPosition_QBDI_PREINST, Some(qbdicb), null_mut(), 0);
-        let _ = managed.vm.record_memory_access(MemoryAccessType_QBDI_MEMORY_READ);
+            .record_memory_access(MemoryAccessType_QBDI_MEMORY_READ);
         let mem_cb = managed.vm.add_mem_access_cb(
             MemoryAccessType_QBDI_MEMORY_READ,
             Some(mem_acc_cb),
