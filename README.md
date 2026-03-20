@@ -11,7 +11,7 @@ git lfs pull
 
 - JS 全局对象新增 `qbdi`
   - 用于在设备侧直接创建 QBDI VM、配置插桩范围、模拟调用、执行 `run()` 和读取寄存器返回值。
-  - qbdi.registerTraceCallbacks(vm,addr), 配合qbdi-replay项目 + IDA插件，实现IDA trace回放，默认trace打包位置：/data/data/com.xxx/trace_bundle.pb
+  - qbdi.registerTraceCallbacks(vm,addr), 配合qbdi-replay项目 + IDA插件，实现IDA trace回放，默认trace打包位置：/data/data/com.xxx/trace_bundle.pb，支持外部匿名段
 
 ## 1. 进入 JS 环境
 
