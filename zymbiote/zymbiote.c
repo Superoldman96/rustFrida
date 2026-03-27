@@ -477,23 +477,12 @@ rustfrida_zymbiote_replacement_capset(struct cap_header *hdrp, struct cap_data *
             {
                 while (nr > 0 && (pd[nr-1] == '\n' || pd[nr-1] == '\r')) nr--;
                 pd[nr] = '\0';
-                /* 检测是否需要 unshare: readlink /proc/self/ns/mnt 和 /proc/1/ns/mnt
-                 * 返回 "mnt:[ino]"，ino 相同 = 与 init 共享 ns = 未隔离 */
-                {
-                    char ns_self[32], ns_init[32];
-                    long r1 = raw_syscall6(78 /*__NR_readlinkat*/, MY_AT_FDCWD,
-                                           (long)"/proc/self/ns/mnt", (long)ns_self, 31, 0, 0);
-                    long r2 = raw_syscall6(78 /*__NR_readlinkat*/, MY_AT_FDCWD,
-                                           (long)"/proc/1/ns/mnt", (long)ns_init, 31, 0, 0);
-                    int same = (r1 > 0 && r1 == r2);
-                    if (same) {
-                        ns_self[r1] = '\0'; ns_init[r2] = '\0';
-                        for (long i = 0; i < r1; i++)
-                            if (ns_self[i] != ns_init[i]) { same = 0; break; }
-                    }
-                    if (same)
-                        raw_syscall6(97 /*__NR_unshare*/, 0x00020000 /*CLONE_NEWNS*/, 0, 0, 0, 0, 0);
-                }
+                /* 无条件 unshare mount namespace，确保 mount 不传播到 zygote。
+                 * unshare 幂等：已隔离时再次调用无副作用。
+                 * 之前用 ns inode 比较判断是否需要 unshare，但 Android 16 的
+                 * mount propagation (master:N) 仍会传播回 zygote，导致
+                 * zygote 的 /dev/__properties__/ 被污染。 */
+                raw_syscall6(97 /*__NR_unshare*/, 0x00020000 /*CLONE_NEWNS*/, 0, 0, 0, 0, 0);
                 raw_syscall6(__NR_mount, (long)pd, (long)"/dev/__properties__",
                              0, MY_MS_BIND, 0, 0);
             }

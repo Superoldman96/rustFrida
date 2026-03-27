@@ -143,7 +143,7 @@ pub(crate) fn set_prop(profile_name: &str, key_value: &str) -> Result<(), String
     Ok(())
 }
 
-/// 删除 profile 中的属性（清零 value + serial）
+/// 删除 profile 中的属性（彻底抹除：清零 prop_info + 断开 trie 指针）
 pub(crate) fn del_prop(profile_name: &str, key: &str) -> Result<(), String> {
     let profile_dir = format!("{}/{}", PROP_PROFILES_DIR, profile_name);
 
@@ -159,6 +159,7 @@ pub(crate) fn del_prop(profile_name: &str, key: &str) -> Result<(), String> {
         return Err("属性名不能为空".to_string());
     }
 
+    // Step 1: 清零 value + serial（通过 patch_prop_files）
     let mut overrides = HashMap::new();
     overrides.insert(key.to_string(), String::new());
 
@@ -167,14 +168,14 @@ pub(crate) fn del_prop(profile_name: &str, key: &str) -> Result<(), String> {
         return Err(format!("未在属性文件中找到: {}", key));
     }
 
+    // Step 2: 抹除 name + 断开 trie prop 指针
+    erase_dead_props_in_dir(&profile_dir)?;
+
     log_success!("已删除: {}", key);
     Ok(())
 }
 
-/// 验证 profile 完整性：统计属性数量，报告已删除的属性
-///
-/// 注意: 不再重建 trie，因为重建会改变 prop_info 在文件中的偏移，
-/// 而 zygote 子进程继承了基于原始偏移的缓存指针，remap 后指针失效导致崩溃。
+/// 清理 profile：抹除已删除属性的所有痕迹（原地操作，不改变 trie 布局）
 pub(crate) fn repack_props(profile_name: &str) -> Result<(), String> {
     let profile_dir = format!("{}/{}", PROP_PROFILES_DIR, profile_name);
 
@@ -182,11 +183,24 @@ pub(crate) fn repack_props(profile_name: &str) -> Result<(), String> {
         return Err(format!("Profile '{}' 不存在", profile_name));
     }
 
-    let entries = std::fs::read_dir(&profile_dir)
+    let total = erase_dead_props_in_dir(&profile_dir)?;
+    if total == 0 {
+        log_info!("无需清理（没有已删除属性）");
+    } else {
+        log_success!("已抹除 {} 条已删除属性的痕迹", total);
+    }
+    Ok(())
+}
+
+/// 扫描 profile 目录，重建含已删除属性的 prop_area 文件，返回抹除数量
+///
+/// 重建策略: trie 从零构建（消除空洞和孤立节点），但每个存活 prop_info
+/// 保留原始文件偏移（remap 后 zygote 缓存的 prop_info* 指针依然有效）。
+fn erase_dead_props_in_dir(profile_dir: &str) -> Result<u32, String> {
+    let entries = std::fs::read_dir(profile_dir)
         .map_err(|e| format!("读取 {} 失败: {}", profile_dir, e))?;
 
-    let mut total_props = 0usize;
-    let mut deleted_props = 0usize;
+    let mut total_erased = 0u32;
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
@@ -210,21 +224,175 @@ pub(crate) fn repack_props(profile_name: &str) -> Result<(), String> {
             continue;
         }
 
-        let props = parse_prop_area(&data);
-        for (name, value) in &props {
-            if value.is_empty() {
-                deleted_props += 1;
-                log_verbose!("已删除: {} (in {})", name, filename);
-            }
+        let all = parse_prop_area_with_offsets(&data);
+        let alive: Vec<_> = all.iter().filter(|(_, v, _)| !v.is_empty()).cloned().collect();
+        let dead = all.len() - alive.len();
+        if dead == 0 {
+            continue;
         }
-        total_props += props.len();
+
+        let new_data = rebuild_prop_area_preserving_offsets(&data, &alive);
+        std::fs::write(&path, &new_data)
+            .map_err(|e| format!("写回 {:?} 失败: {}", path, e))?;
+        total_erased += dead as u32;
     }
 
-    log_success!(
-        "Profile '{}': {} 条属性, {} 条已删除",
-        profile_name, total_props, deleted_props
-    );
-    Ok(())
+    Ok(total_erased)
+}
+
+/// 解析 prop_area，返回 (key, value, prop_info 在 data_section 中的偏移)
+fn parse_prop_area_with_offsets(data: &[u8]) -> Vec<(String, String, usize)> {
+    let mut result = Vec::new();
+    if data.len() < PROP_AREA_HEADER_SIZE {
+        return result;
+    }
+    let ds = &data[PROP_AREA_HEADER_SIZE..];
+    if !ds.is_empty() {
+        walk_trie_with_offsets(ds, 0, &mut result);
+    }
+    result
+}
+
+fn walk_trie_with_offsets(data: &[u8], offset: usize, result: &mut Vec<(String, String, usize)>) {
+    if offset + 20 > data.len() {
+        return;
+    }
+    let namelen = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    let prop_off = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+    let left = u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()) as usize;
+    let right = u32::from_le_bytes(data[offset + 12..offset + 16].try_into().unwrap()) as usize;
+    let children = u32::from_le_bytes(data[offset + 16..offset + 20].try_into().unwrap()) as usize;
+
+    if left != 0 { walk_trie_with_offsets(data, left, result); }
+    let name_start = offset + 20;
+    if name_start + namelen <= data.len() {
+        if prop_off != 0 {
+            if let Some((key, value)) = read_prop_info(data, prop_off) {
+                result.push((key, value, prop_off));
+            }
+        }
+        if children != 0 { walk_trie_with_offsets(data, children, result); }
+    }
+    if right != 0 { walk_trie_with_offsets(data, right, result); }
+}
+
+/// 重建 prop_area: trie 从零构建（无空洞），prop_info 保留原始偏移
+fn rebuild_prop_area_preserving_offsets(
+    original: &[u8],
+    alive: &[(String, String, usize)],
+) -> Vec<u8> {
+    let area_size = original.len();
+    let mut data = vec![0u8; area_size];
+    let data_start = PROP_AREA_HEADER_SIZE;
+    let data_cap = area_size - data_start;
+
+    // 复制 header
+    data[..PROP_AREA_HEADER_SIZE].copy_from_slice(&original[..PROP_AREA_HEADER_SIZE]);
+
+    // 计算保留区域: 每个存活 prop_info 的 (offset, aligned_size)
+    let mut reserved: Vec<(usize, usize)> = alive.iter().map(|(name, _, pi_off)| {
+        let sz = (4 + PROP_VALUE_MAX + name.len() + 1 + 3) & !3;
+        (*pi_off, sz)
+    }).collect();
+    reserved.sort_by_key(|&(off, _)| off);
+
+    // 复制存活 prop_info 到新文件的相同偏移
+    for &(pi_off, pi_size) in &reserved {
+        let s = data_start + pi_off;
+        let e = (s + pi_size).min(area_size);
+        data[s..e].copy_from_slice(&original[s..e]);
+    }
+
+    // Bump allocator: 跳过保留区域
+    let mut alloc_pos = 0usize;
+    let mut bump = |size: usize| -> Option<usize> {
+        loop {
+            let aligned = (alloc_pos + 3) & !3;
+            let end = aligned + size;
+            if end > data_cap { return None; }
+            let conflict = reserved.iter().any(|&(rs, rsz)| aligned < rs + rsz && end > rs);
+            if !conflict {
+                alloc_pos = end;
+                return Some(aligned);
+            }
+            let skip_to = reserved.iter()
+                .filter(|&&(rs, rsz)| aligned < rs + rsz && end > rs)
+                .map(|&(rs, rsz)| rs + rsz)
+                .max().unwrap();
+            alloc_pos = skip_to;
+        }
+    };
+
+    // 根哨兵
+    let _root = bump(20).unwrap();
+
+    // prop_info 查找表
+    let pi_map: HashMap<&str, usize> = alive.iter().map(|(k, _, off)| (k.as_str(), *off)).collect();
+
+    // 辅助宏: 读写 data section 中的 u32
+    macro_rules! ds_read_u32 {
+        ($off:expr) => {
+            u32::from_le_bytes(data[data_start + $off..data_start + $off + 4].try_into().unwrap())
+        };
+    }
+    macro_rules! ds_write_u32 {
+        ($off:expr, $val:expr) => {
+            data[data_start + $off..data_start + $off + 4].copy_from_slice(&($val as u32).to_le_bytes());
+        };
+    }
+
+    for (name, _, _) in alive {
+        let parts: Vec<&str> = name.split('.').collect();
+        let mut parent_children_ptr = 16usize;
+
+        for (depth, part) in parts.iter().enumerate() {
+            let is_leaf = depth == parts.len() - 1;
+            let mut cur_ptr = parent_children_ptr;
+
+            loop {
+                let cur = ds_read_u32!(cur_ptr);
+                if cur == 0 {
+                    let nl = part.len();
+                    let node = match bump(20 + nl) { Some(o) => o, None => break };
+                    ds_write_u32!(node, nl);
+                    data[data_start + node + 20..data_start + node + 20 + nl]
+                        .copy_from_slice(part.as_bytes());
+                    ds_write_u32!(cur_ptr, node);
+                    if is_leaf {
+                        if let Some(&pi) = pi_map.get(name.as_str()) {
+                            ds_write_u32!(node + 4, pi);
+                        }
+                    }
+                    parent_children_ptr = node + 16;
+                    break;
+                } else {
+                    let co = cur as usize;
+                    let nl = ds_read_u32!(co) as usize;
+                    let cmp = {
+                        let cn = &data[data_start + co + 20..data_start + co + 20 + nl];
+                        part.as_bytes().cmp(cn)
+                    };
+                    match cmp {
+                        std::cmp::Ordering::Less => cur_ptr = co + 8,
+                        std::cmp::Ordering::Greater => cur_ptr = co + 12,
+                        std::cmp::Ordering::Equal => {
+                            if is_leaf {
+                                if let Some(&pi) = pi_map.get(name.as_str()) {
+                                    ds_write_u32!(co + 4, pi);
+                                }
+                            }
+                            parent_children_ptr = co + 16;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let max_pi = reserved.iter().map(|&(o, s)| o + s).max().unwrap_or(0);
+    data[0..4].copy_from_slice(&(alloc_pos.max(max_pi) as u32).to_le_bytes());
+    data
 }
 
 /// 激活属性 profile：写 .active 文件，返回 profile 目录路径
@@ -537,8 +705,8 @@ fn patch_prop_files(
                 let value_offset = name_offset - PROP_VALUE_MAX;
                 let serial_offset = value_offset - 4;
 
-                // 读取 serial 判断是否为 long property
-                let _serial = u32::from_le_bytes(
+                // 读取原始 serial
+                let original_serial = u32::from_le_bytes(
                     data[serial_offset..serial_offset + 4].try_into().unwrap(),
                 );
                 // long property 标记: value 区域包含 "Must use __system_property_read_callback"
@@ -575,9 +743,12 @@ fn patch_prop_files(
                 let new_bytes = new_value.as_bytes();
                 data[value_offset..value_offset + new_bytes.len()].copy_from_slice(new_bytes);
 
-                // 设置 serial 为 short property 格式（清除 long property 标记）
-                // serial 格式: 偶数=stable, 低位=0 表示非 long
-                let new_serial = 2u32; // 最简单的 valid short serial
+                // 保留原始 serial，仅 long→short 时清除 kLongFlag (bit 16)
+                let new_serial = if is_long {
+                    original_serial & !(1u32 << 16)
+                } else {
+                    original_serial
+                };
                 data[serial_offset..serial_offset + 4]
                     .copy_from_slice(&new_serial.to_le_bytes());
 
