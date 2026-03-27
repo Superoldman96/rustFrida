@@ -125,18 +125,17 @@ pub(crate) fn set_prop(profile_name: &str, key_value: &str) -> Result<(), String
     if key.is_empty() {
         return Err("属性名不能为空".to_string());
     }
-    if value.len() >= PROP_VALUE_MAX {
-        return Err(format!("属性值超过 {} 字节限制", PROP_VALUE_MAX - 1));
-    }
-
     let mut overrides = HashMap::new();
     overrides.insert(key.to_string(), value.to_string());
 
-    let count = patch_prop_files(&profile_dir, &overrides)?;
+    let (count, modified_files) = patch_prop_files(&profile_dir, &overrides)?;
     if count == 0 {
         // 属性不存在，添加新属性到最匹配的 prop_area 文件
         log_info!("属性 {} 不存在，添加新属性...", key);
         add_prop_to_profile(&profile_dir, key, value)?;
+    } else if !modified_files.is_empty() {
+        // 仅对被修改的文件重建，清理 long 转换产生的空洞
+        erase_dead_props_in_dir(&profile_dir, Some(&modified_files))?;
     }
 
     log_success!("{} = {}", key, value);
@@ -163,13 +162,13 @@ pub(crate) fn del_prop(profile_name: &str, key: &str) -> Result<(), String> {
     let mut overrides = HashMap::new();
     overrides.insert(key.to_string(), String::new());
 
-    let count = patch_prop_files(&profile_dir, &overrides)?;
+    let (count, modified_files) = patch_prop_files(&profile_dir, &overrides)?;
     if count == 0 {
         return Err(format!("未在属性文件中找到: {}", key));
     }
 
-    // Step 2: 抹除 name + 断开 trie prop 指针
-    erase_dead_props_in_dir(&profile_dir)?;
+    // Step 2: 重建被修改的文件，抹除已删除属性的所有痕迹
+    erase_dead_props_in_dir(&profile_dir, Some(&modified_files))?;
 
     log_success!("已删除: {}", key);
     Ok(())
@@ -183,7 +182,7 @@ pub(crate) fn repack_props(profile_name: &str) -> Result<(), String> {
         return Err(format!("Profile '{}' 不存在", profile_name));
     }
 
-    let total = erase_dead_props_in_dir(&profile_dir)?;
+    let total = erase_dead_props_in_dir(&profile_dir, None)?;
     if total == 0 {
         log_info!("无需清理（没有已删除属性）");
     } else {
@@ -196,7 +195,8 @@ pub(crate) fn repack_props(profile_name: &str) -> Result<(), String> {
 ///
 /// 重建策略: trie 从零构建（消除空洞和孤立节点），但每个存活 prop_info
 /// 保留原始文件偏移（remap 后 zygote 缓存的 prop_info* 指针依然有效）。
-fn erase_dead_props_in_dir(profile_dir: &str) -> Result<u32, String> {
+/// `only_files`: 仅重建指定文件名（None = 所有文件）
+fn erase_dead_props_in_dir(profile_dir: &str, only_files: Option<&[String]>) -> Result<u32, String> {
     let entries = std::fs::read_dir(profile_dir)
         .map_err(|e| format!("读取 {} 失败: {}", profile_dir, e))?;
 
@@ -212,6 +212,12 @@ fn erase_dead_props_in_dir(profile_dir: &str) -> Result<u32, String> {
         if matches!(filename.as_str(), "props.txt" | "properties_serial" | "property_info" | ".active") {
             continue;
         }
+        // 仅处理指定文件
+        if let Some(files) = only_files {
+            if !files.iter().any(|f| f == &filename) {
+                continue;
+            }
+        }
 
         let data = std::fs::read(&path)
             .map_err(|e| format!("读取 {:?} 失败: {}", path, e))?;
@@ -226,15 +232,13 @@ fn erase_dead_props_in_dir(profile_dir: &str) -> Result<u32, String> {
 
         let all = parse_prop_area_with_offsets(&data);
         let alive: Vec<_> = all.iter().filter(|(_, v, _)| !v.is_empty()).cloned().collect();
-        let dead = all.len() - alive.len();
-        if dead == 0 {
-            continue;
-        }
 
         let new_data = rebuild_prop_area_preserving_offsets(&data, &alive);
-        std::fs::write(&path, &new_data)
-            .map_err(|e| format!("写回 {:?} 失败: {}", path, e))?;
-        total_erased += dead as u32;
+        if new_data != data {
+            std::fs::write(&path, &new_data)
+                .map_err(|e| format!("写回 {:?} 失败: {}", path, e))?;
+            total_erased += 1;
+        }
     }
 
     Ok(total_erased)
@@ -289,17 +293,39 @@ fn rebuild_prop_area_preserving_offsets(
     // 复制 header
     data[..PROP_AREA_HEADER_SIZE].copy_from_slice(&original[..PROP_AREA_HEADER_SIZE]);
 
-    // 计算保留区域: 每个存活 prop_info 的 (offset, aligned_size)
-    let mut reserved: Vec<(usize, usize)> = alive.iter().map(|(name, _, pi_off)| {
-        let sz = (4 + PROP_VALUE_MAX + name.len() + 1 + 3) & !3;
-        (*pi_off, sz)
-    }).collect();
+    // 计算保留区域: prop_info + long value（如果是 long property）
+    let mut reserved: Vec<(usize, usize)> = Vec::new();
+    for (name, _, pi_off) in alive {
+        let pi_base = (4 + PROP_VALUE_MAX + name.len() + 1 + 3) & !3;
+        reserved.push((*pi_off, pi_base));
+
+        // 检测 long property: serial kLongFlag (bit 16)
+        let serial_abs = data_start + pi_off;
+        if serial_abs + 4 + 60 <= original.len() {
+            let serial = u32::from_le_bytes(
+                original[serial_abs..serial_abs + 4].try_into().unwrap(),
+            );
+            if serial & (1u32 << 16) != 0 {
+                // long value offset 在 value[56..60]
+                let offset = u32::from_le_bytes(
+                    original[serial_abs + 4 + 56..serial_abs + 4 + 60].try_into().unwrap(),
+                ) as usize;
+                let long_abs = serial_abs + offset;
+                if long_abs < original.len() {
+                    let long_len = original[long_abs..].iter()
+                        .position(|&b| b == 0).unwrap_or(0);
+                    let long_ds_off = long_abs - data_start;
+                    reserved.push((long_ds_off, (long_len + 1 + 3) & !3));
+                }
+            }
+        }
+    }
     reserved.sort_by_key(|&(off, _)| off);
 
-    // 复制存活 prop_info 到新文件的相同偏移
-    for &(pi_off, pi_size) in &reserved {
-        let s = data_start + pi_off;
-        let e = (s + pi_size).min(area_size);
+    // 复制保留区域（prop_info + long value）到新文件的相同偏移
+    for &(off, size) in &reserved {
+        let s = data_start + off;
+        let e = (s + size).min(area_size);
         data[s..e].copy_from_slice(&original[s..e]);
     }
 
@@ -530,23 +556,97 @@ fn add_prop_to_profile(
 ///
 /// 从 header.bytes_used 处接着分配 trie 节点和 prop_info，
 /// 沿着已有 trie 路径找到插入点，不改变任何已有节点的偏移。
+/// 分配 prop_info (short 或 long)，返回 data section 内偏移
+fn alloc_prop_info(
+    data: &mut Vec<u8>,
+    data_start: usize,
+    alloc_pos: &mut usize,
+    data_cap: usize,
+    key: &str,
+    value: &str,
+) -> Result<usize, String> {
+    let vb = value.as_bytes();
+    let full_name = key.as_bytes();
+    let need_long = vb.len() >= PROP_VALUE_MAX;
+
+    // 分配 prop_info 基本结构: serial(4) + value(92) + name\0
+    let pi_base_size = 4 + PROP_VALUE_MAX + full_name.len() + 1;
+    let aligned_base = (*alloc_pos + 3) & !3;
+    let mut end = aligned_base + pi_base_size;
+    if end > data_cap {
+        return Err("prop_area 空间不足".to_string());
+    }
+
+    let pi_off = aligned_base;
+
+    if need_long {
+        // long: 分配 name\0 后紧跟 long value
+        let long_val_off = (end + 3) & !3;
+        end = long_val_off + vb.len() + 1;
+        if end > data_cap {
+            return Err("prop_area 空间不足（long value）".to_string());
+        }
+
+        // serial: kLongFlag
+        let serial = 2u32 | (1u32 << 16);
+        data[data_start + pi_off..data_start + pi_off + 4]
+            .copy_from_slice(&serial.to_le_bytes());
+
+        // value 区域: 占位符 + offset
+        let placeholder = b"Must use __system_property_read_callback() to read";
+        let plen = placeholder.len().min(56);
+        data[data_start + pi_off + 4..data_start + pi_off + 4 + plen]
+            .copy_from_slice(&placeholder[..plen]);
+        // offset = long_value 绝对位置 - serial 绝对位置
+        let offset = ((data_start + long_val_off) - (data_start + pi_off)) as u32;
+        data[data_start + pi_off + 4 + 56..data_start + pi_off + 4 + 60]
+            .copy_from_slice(&offset.to_le_bytes());
+
+        // name
+        let noff = pi_off + 4 + PROP_VALUE_MAX;
+        data[data_start + noff..data_start + noff + full_name.len()]
+            .copy_from_slice(full_name);
+
+        // long value
+        data[data_start + long_val_off..data_start + long_val_off + vb.len()]
+            .copy_from_slice(vb);
+
+        *alloc_pos = end;
+    } else {
+        // short
+        data[data_start + pi_off..data_start + pi_off + 4]
+            .copy_from_slice(&2u32.to_le_bytes()); // serial = 2
+        let vlen = vb.len().min(PROP_VALUE_MAX - 1);
+        data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen]
+            .copy_from_slice(&vb[..vlen]);
+        let noff = pi_off + 4 + PROP_VALUE_MAX;
+        data[data_start + noff..data_start + noff + full_name.len()]
+            .copy_from_slice(full_name);
+
+        *alloc_pos = end;
+    }
+
+    Ok(pi_off)
+}
+
 fn insert_prop_inplace(data: &mut Vec<u8>, key: &str, value: &str) -> Result<(), String> {
     let data_start = PROP_AREA_HEADER_SIZE;
     let data_cap = data.len() - data_start;
 
-    // 读取当前 bump 位置
     let mut alloc_pos =
         u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
 
-    // bump 分配器（4 字节对齐）
-    let mut bump = |size: usize| -> Result<usize, String> {
-        let aligned = (alloc_pos + 3) & !3;
-        if aligned + size > data_cap {
-            return Err("prop_area 空间不足".to_string());
-        }
-        alloc_pos = aligned + size;
-        Ok(aligned)
-    };
+    // inline bump helper (不用 closure 避免借用冲突)
+    macro_rules! bump {
+        ($size:expr) => {{
+            let aligned = (alloc_pos + 3) & !3;
+            if aligned + $size > data_cap {
+                return Err("prop_area 空间不足".to_string());
+            }
+            alloc_pos = aligned + $size;
+            aligned
+        }};
+    }
 
     let read_u32 =
         |data: &[u8], off: usize| u32::from_le_bytes(data[data_start + off..data_start + off + 4].try_into().unwrap());
@@ -567,7 +667,7 @@ fn insert_prop_inplace(data: &mut Vec<u8>, key: &str, value: &str) -> Result<(),
             if cur == 0 {
                 // 空位 → 创建新 trie 节点
                 let namelen = part.len();
-                let node_off = bump(20 + namelen)?;
+                let node_off = bump!(20 + namelen);
                 write_u32(data, node_off, namelen as u32); // namelen
                 data[data_start + node_off + 20..data_start + node_off + 20 + namelen]
                     .copy_from_slice(part.as_bytes());
@@ -575,18 +675,7 @@ fn insert_prop_inplace(data: &mut Vec<u8>, key: &str, value: &str) -> Result<(),
                 write_u32(data, cur_ptr_off, node_off as u32);
 
                 if is_leaf {
-                    // 分配 prop_info: serial(4) + value(92) + name\0
-                    let full_name = key.as_bytes();
-                    let pi_off = bump(4 + PROP_VALUE_MAX + full_name.len() + 1)?;
-                    write_u32(data, pi_off, 2); // serial = 2
-                    let vb = value.as_bytes();
-                    let vlen = vb.len().min(PROP_VALUE_MAX - 1);
-                    data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen]
-                        .copy_from_slice(&vb[..vlen]);
-                    let noff = pi_off + 4 + PROP_VALUE_MAX;
-                    data[data_start + noff..data_start + noff + full_name.len()]
-                        .copy_from_slice(full_name);
-                    // prop 指针
+                    let pi_off = alloc_prop_info(data, data_start, &mut alloc_pos, data_cap, key, value)?;
                     write_u32(data, node_off + 4, pi_off as u32);
                 }
                 cur_ptr_off = node_off + 16; // children
@@ -602,17 +691,7 @@ fn insert_prop_inplace(data: &mut Vec<u8>, key: &str, value: &str) -> Result<(),
                     std::cmp::Ordering::Greater => cur_ptr_off = cur_off + 12, // right
                     std::cmp::Ordering::Equal => {
                         if is_leaf {
-                            // 叶节点已存在 → 分配新 prop_info 并更新指针
-                            let full_name = key.as_bytes();
-                            let pi_off = bump(4 + PROP_VALUE_MAX + full_name.len() + 1)?;
-                            write_u32(data, pi_off, 2);
-                            let vb = value.as_bytes();
-                            let vlen = vb.len().min(PROP_VALUE_MAX - 1);
-                            data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen]
-                                .copy_from_slice(&vb[..vlen]);
-                            let noff = pi_off + 4 + PROP_VALUE_MAX;
-                            data[data_start + noff..data_start + noff + full_name.len()]
-                                .copy_from_slice(full_name);
+                            let pi_off = alloc_prop_info(data, data_start, &mut alloc_pos, data_cap, key, value)?;
                             write_u32(data, cur_off + 4, pi_off as u32);
                         }
                         cur_ptr_off = cur_off + 16; // children
@@ -636,12 +715,13 @@ fn insert_prop_inplace(data: &mut Vec<u8>, key: &str, value: &str) -> Result<(),
 fn patch_prop_files(
     profile_dir: &str,
     overrides: &HashMap<String, String>,
-) -> Result<usize, String> {
+) -> Result<(usize, Vec<String>), String> {
     if overrides.is_empty() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
 
     let mut patch_count = 0usize;
+    let mut modified_files: Vec<String> = Vec::new();
     let mut remaining: HashMap<&str, &str> = overrides
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -715,10 +795,11 @@ fn patch_prop_files(
 
                 // 读取旧值
                 let old_value = if is_long {
-                    // long property: 实际值在 name 之后
-                    let long_start = name_offset + key.len() + 1; // name\0 之后
-                    // 对齐到 4 字节
-                    let long_start = (long_start + 3) & !3;
+                    // long property: offset 在 value[56..60]，相对于 serial
+                    let long_off = u32::from_le_bytes(
+                        data[value_offset + 56..value_offset + 60].try_into().unwrap(),
+                    ) as usize;
+                    let long_start = serial_offset + long_off;
                     if long_start < data.len() {
                         let end = data[long_start..].iter()
                             .position(|&b| b == 0)
@@ -736,21 +817,75 @@ fn patch_prop_files(
                         .to_string()
                 };
 
-                // 写入新值: 清零 value 区域 + 写入短值 + 重置 serial 为 short property
+                let new_bytes = new_value.as_bytes();
+                let need_long = new_bytes.len() >= PROP_VALUE_MAX;
+
+                // 清零旧 long value 残留（如果有）
+                if is_long {
+                    let long_off = u32::from_le_bytes(
+                        data[value_offset + 56..value_offset + 60].try_into().unwrap(),
+                    ) as usize;
+                    let long_start = serial_offset + long_off;
+                    if long_start < data.len() {
+                        let long_end = data[long_start..].iter()
+                            .position(|&b| b == 0)
+                            .map(|p| long_start + p + 1)
+                            .unwrap_or(long_start);
+                        for b in data[long_start..long_end].iter_mut() {
+                            *b = 0;
+                        }
+                    }
+                }
+
+                // 清零 value 区域
                 for byte in data[value_offset..value_offset + PROP_VALUE_MAX].iter_mut() {
                     *byte = 0;
                 }
-                let new_bytes = new_value.as_bytes();
-                data[value_offset..value_offset + new_bytes.len()].copy_from_slice(new_bytes);
 
-                // 保留原始 serial，仅 long→short 时清除 kLongFlag (bit 16)
-                let new_serial = if is_long {
-                    original_serial & !(1u32 << 16)
+                if need_long {
+                    // 写 long property: 在 bytes_used 处分配空间
+                    let mut bytes_used = u32::from_le_bytes(
+                        data[0..4].try_into().unwrap(),
+                    ) as usize;
+                    let alloc_pos = (bytes_used + 3) & !3;
+                    let long_abs = PROP_AREA_HEADER_SIZE + alloc_pos;
+                    let long_end = long_abs + new_bytes.len() + 1;
+                    if long_end <= data.len() {
+                        // 写入 long value
+                        data[long_abs..long_abs + new_bytes.len()].copy_from_slice(new_bytes);
+                        data[long_abs + new_bytes.len()] = 0;
+                        bytes_used = alloc_pos + new_bytes.len() + 1;
+                        data[0..4].copy_from_slice(&(bytes_used as u32).to_le_bytes());
+
+                        // value 区域: 占位符 + offset
+                        let placeholder = b"Must use __system_property_read_callback() to read";
+                        let plen = placeholder.len().min(56);
+                        data[value_offset..value_offset + plen].copy_from_slice(&placeholder[..plen]);
+                        // offset = long_value 绝对地址 - prop_info serial 绝对地址
+                        let offset = (long_abs - serial_offset) as u32;
+                        data[value_offset + 56..value_offset + 60]
+                            .copy_from_slice(&offset.to_le_bytes());
+                        // serial: 设置 kLongFlag
+                        let new_serial = original_serial | (1u32 << 16);
+                        data[serial_offset..serial_offset + 4]
+                            .copy_from_slice(&new_serial.to_le_bytes());
+                    } else {
+                        log_warn!("属性 {} 的 long value 分配空间不足", key);
+                        continue;
+                    }
                 } else {
-                    original_serial
-                };
-                data[serial_offset..serial_offset + 4]
-                    .copy_from_slice(&new_serial.to_le_bytes());
+                    // 写 short property
+                    data[value_offset..value_offset + new_bytes.len()]
+                        .copy_from_slice(new_bytes);
+                    // serial: 清除 kLongFlag（如果原来是 long）
+                    let new_serial = if is_long {
+                        original_serial & !(1u32 << 16)
+                    } else {
+                        original_serial
+                    };
+                    data[serial_offset..serial_offset + 4]
+                        .copy_from_slice(&new_serial.to_le_bytes());
+                }
 
                 log_verbose!(
                     "修补属性 [{}] 在 {} (offset=0x{:x}): '{}' → '{}'",
@@ -770,6 +905,7 @@ fn patch_prop_files(
         if modified {
             std::fs::write(&path, &data)
                 .map_err(|e| format!("写回 {:?} 失败: {}", path, e))?;
+            modified_files.push(filename);
         }
     }
 
@@ -778,7 +914,7 @@ fn patch_prop_files(
         log_warn!("未在属性文件中找到: {} (可能是运行时动态设置的属性)", key);
     }
 
-    Ok(patch_count)
+    Ok((patch_count, modified_files))
 }
 
 /// 在 haystack 中搜索 needle，返回首次匹配的起始偏移
@@ -879,12 +1015,18 @@ fn read_prop_info(data: &[u8], offset: usize) -> Option<(String, String)> {
         .starts_with(b"Must use _");
 
     let value = if is_long {
-        // long property: 实际值在 name\0 之后（4字节对齐）
-        let long_start = name_start + name_end + 1;
-        let long_start = (long_start + 3) & !3;
-        if long_start < data.len() {
-            let end = data[long_start..].iter().position(|&b| b == 0).unwrap_or(0);
-            String::from_utf8_lossy(&data[long_start..long_start + end]).to_string()
+        // long property: offset 在 value[56..60]，相对于 prop_info 起始 (serial)
+        if value_start + 60 <= data.len() {
+            let long_off = u32::from_le_bytes(
+                data[value_start + 56..value_start + 60].try_into().unwrap(),
+            ) as usize;
+            let long_start = offset + long_off; // offset = prop_info serial 在 data section 的偏移
+            if long_start < data.len() {
+                let end = data[long_start..].iter().position(|&b| b == 0).unwrap_or(0);
+                String::from_utf8_lossy(&data[long_start..long_start + end]).to_string()
+            } else {
+                String::new()
+            }
         } else {
             String::new()
         }
